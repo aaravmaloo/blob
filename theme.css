@@ -1,0 +1,13 @@
+:root {
+  --surface: #000000;
+  --panel-surface: #000000;
+  --panel-edge: #2f4b7a;
+  --panel-glow: #8ab4ff;
+  --ink: #eaf1ff;
+  --muted: #95a9cd;
+  --accent: #93b7ff;
+  --cyan: #bfd3ff;
+  --rose: #aac3f4;
+  --selected-bg: #9ec1ff;
+  --selected-fg: #000000;
+}
