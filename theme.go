@@ -11,17 +11,19 @@ var cssVarPattern = regexp.MustCompile(`--([a-z0-9-]+)\s*:\s*(#[0-9a-fA-F]{6})\s
 
 func loadThemeVars() map[string]string {
 	vars := map[string]string{
-		"surface":       "#000000",
-		"panel-surface": "#000000",
-		"panel-edge":    "#2F4B7A",
-		"panel-glow":    "#8AB4FF",
-		"ink":           "#EAF1FF",
-		"muted":         "#95A9CD",
-		"accent":        "#93B7FF",
-		"cyan":          "#BFD3FF",
-		"rose":          "#AAC3F4",
-		"selected-bg":   "#9EC1FF",
-		"selected-fg":   "#000000",
+		"surface":       "#0d0d12",
+		"panel-surface": "#13131f",
+		"panel-edge":    "#2d2d44",
+		"panel-glow":    "#7c3aed",
+		"ink":           "#e2e8f0",
+		"muted":         "#64748b",
+		"accent":        "#a78bfa",
+		"cyan":          "#22d3ee",
+		"rose":          "#fb7185",
+		"selected-bg":   "#7c3aed",
+		"selected-fg":   "#ffffff",
+		"gold":          "#fbbf24",
+		"green":         "#4ade80",
 	}
 
 	var cssData []byte
@@ -51,8 +53,8 @@ func loadThemeVars() map[string]string {
 		val := strings.TrimSpace(m[2])
 		vars[key] = val
 	}
-	// Always enforce OLED black backgrounds.
-	vars["surface"] = "#000000"
-	vars["panel-surface"] = "#000000"
+	// Enforce dark theme base.
+	vars["surface"] = "#0d0d12"
+	vars["panel-surface"] = "#13131f"
 	return vars
 }
