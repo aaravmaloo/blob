@@ -4,9 +4,13 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"time"
 
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/sahilm/fuzzy"
 )
 
 type panel string
@@ -14,13 +18,15 @@ type panel string
 const (
 	panelBrowser panel = "browser"
 	panelEditor  panel = "editor"
+	panelPreview panel = "preview"
 )
 
 type mode string
 
 const (
-	modeSplit mode = "split"
-	modeZen   mode = "zen"
+	modeSplit   mode = "split"
+	modeZen     mode = "zen"
+	modePreview mode = "preview"
 )
 
 type visibleNode struct {
@@ -53,7 +59,22 @@ type model struct {
 	renameIsFolder bool
 	showChromeHint bool
 
+	searchMode    bool
+	searchInput   textinput.Model
+	searchResults []fuzzy.Match
+	allNotes      []noteEntry
+	previewContent string
+	glamourRender  *glamour.TermRenderer
+	splashPhase    int
+	splashStart    time.Time
+	frame          int
+
 	styles uiStyles
+}
+
+type noteEntry struct {
+	path string
+	name string
 }
 
 type uiStyles struct {
@@ -74,8 +95,16 @@ type uiStyles struct {
 	statusBar    lipgloss.Style
 	badge        lipgloss.Style
 	badgeActive  lipgloss.Style
+	badgeGold    lipgloss.Style
+	badgeGreen   lipgloss.Style
 	help         lipgloss.Style
 	empty        lipgloss.Style
+	icon         lipgloss.Style
+	iconFolder   lipgloss.Style
+	iconNote     lipgloss.Style
+	searchBox    lipgloss.Style
+	splash       lipgloss.Style
+	previewBox   lipgloss.Style
 }
 
 const (
@@ -89,6 +118,16 @@ func newModel(storage *storage) (model, error) {
 		return model{}, err
 	}
 
+	searchInput := textinput.New()
+	searchInput.Placeholder = "Search notes..."
+	searchInput.CharLimit = 50
+	searchInput.Width = 30
+
+	gr, _ := glamour.NewTermRenderer(
+		glamour.WithAutoStyle(),
+		glamour.WithWordWrap(80),
+	)
+
 	m := model{
 		storage:        storage,
 		activePanel:    panelBrowser,
@@ -98,8 +137,14 @@ func newModel(storage *storage) (model, error) {
 		editor:         newEditor(),
 		collapsed:      make(map[string]bool),
 		showChromeHint: true,
+		searchInput:    searchInput,
+		glamourRender:  gr,
+		splashPhase:    0,
+		splashStart:    time.Now(),
+		frame:          0,
 	}
 	m.styles = buildStyles()
+	m.collectAllNotes()
 
 	if err := m.reloadTree(); err != nil {
 		return model{}, err
@@ -121,6 +166,8 @@ func buildStyles() uiStyles {
 	rose := lipgloss.Color(vars["rose"])
 	selectedBG := lipgloss.Color(vars["selected-bg"])
 	selectedFG := lipgloss.Color(vars["selected-fg"])
+	gold := lipgloss.Color(vars["gold"])
+	green := lipgloss.Color(vars["green"])
 
 	return uiStyles{
 		app: lipgloss.NewStyle().
@@ -136,41 +183,58 @@ func buildStyles() uiStyles {
 			Margin(0, 0, 1, 0),
 		title: lipgloss.NewStyle().
 			Foreground(accent).
-			Bold(true),
+			Bold(true).
+			Underline(true),
 		subtitle: lipgloss.NewStyle().
 			Foreground(muted),
 		panel: lipgloss.NewStyle().
 			Background(panelSurface).
-			Border(lipgloss.RoundedBorder()).
+			Border(lipgloss.NormalBorder()).
 			BorderForeground(panelEdge).
+			BorderTop(true).
+			BorderBottom(true).
+			BorderLeft(true).
+			BorderRight(true).
 			Padding(1),
 		panelFocused: lipgloss.NewStyle().
 			Background(panelSurface).
-			Border(lipgloss.RoundedBorder()).
+			Border(lipgloss.NormalBorder()).
 			BorderForeground(panelGlow).
+			BorderTop(true).
+			BorderBottom(true).
+			BorderLeft(true).
+			BorderRight(true).
 			Padding(1),
 		panelTitle: lipgloss.NewStyle().
 			Foreground(accent).
-			Bold(true),
+			Bold(true).
+			MarginBottom(1),
 		panelMeta: lipgloss.NewStyle().
-			Foreground(muted),
+			Foreground(muted).
+			Faint(true),
 		item: lipgloss.NewStyle().
-			Foreground(ink),
+			Foreground(ink).
+			PaddingLeft(1),
 		itemSelected: lipgloss.NewStyle().
 			Foreground(selectedFG).
 			Background(selectedBG).
 			Bold(true).
-			Padding(0, 1),
+			Padding(0, 1).
+			BorderLeft(true).
+			BorderForeground(panelGlow),
 		itemMuted: lipgloss.NewStyle().
-			Foreground(muted),
+			Foreground(muted).
+			Faint(true),
 		folder: lipgloss.NewStyle().
 			Foreground(rose).
 			Bold(true),
 		editorText: lipgloss.NewStyle().
-			Foreground(ink),
+			Foreground(ink).
+			PaddingLeft(1),
 		editorCursor: lipgloss.NewStyle().
 			Background(cyan).
-			Foreground(surface),
+			Foreground(surface).
+			Bold(true),
 		statusBar: lipgloss.NewStyle().
 			Background(panelSurface).
 			Foreground(ink).
@@ -188,16 +252,60 @@ func buildStyles() uiStyles {
 			Background(selectedBG).
 			Bold(true).
 			Padding(0, 1),
+		badgeGold: lipgloss.NewStyle().
+			Foreground(surface).
+			Background(gold).
+			Bold(true).
+			Padding(0, 1),
+		badgeGreen: lipgloss.NewStyle().
+			Foreground(surface).
+			Background(green).
+			Bold(true).
+			Padding(0, 1),
 		help: lipgloss.NewStyle().
-			Foreground(muted),
+			Foreground(muted).
+			Faint(true),
 		empty: lipgloss.NewStyle().
 			Foreground(muted).
-			Italic(true),
+			Italic(true).
+			Faint(true),
+		icon: lipgloss.NewStyle().
+			Foreground(accent),
+		iconFolder: lipgloss.NewStyle().
+			Foreground(rose),
+		iconNote: lipgloss.NewStyle().
+			Foreground(cyan),
+		searchBox: lipgloss.NewStyle().
+			Background(panelSurface).
+			Foreground(ink).
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(panelGlow).
+			Padding(0, 1).
+			Margin(1, 0),
+		splash: lipgloss.NewStyle().
+			Foreground(accent).
+			Bold(true).
+			Align(lipgloss.Center),
+		previewBox: lipgloss.NewStyle().
+			Background(panelSurface).
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(panelGlow).
+			Padding(1),
 	}
 }
 
 func (m model) Init() tea.Cmd {
-	return nil
+	return frameTick()
+}
+
+func frameTick() tea.Cmd {
+	return tea.Tick(time.Second/30, func(t time.Time) tea.Msg {
+		return tickMsg{time: t}
+	})
+}
+
+type tickMsg struct {
+	time time.Time
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -205,7 +313,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.searchInput.Width = max(20, m.width/3)
 		return m, nil
+	case tickMsg:
+		m.frame++
+		if m.splashPhase < 3 && time.Since(m.splashStart) > time.Duration(m.splashPhase+1)*400*time.Millisecond {
+			m.splashPhase++
+		}
+		return m, frameTick()
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" || (msg.String() == "q" && m.canQuitWithQ()) {
 			return m, tea.Quit
@@ -218,6 +333,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m model) handleKey(msg tea.KeyMsg) model {
 	key := msg.String()
 	inInsert := m.activePanel == panelEditor && (!m.editor.vimEnabled || m.editor.mode == editorModeInsert)
+
+	if m.searchMode {
+		return m.handleSearchKey(msg)
+	}
 
 	if m.renaming {
 		return m.handleRenameKey(msg)
@@ -291,6 +410,28 @@ func (m model) handleKey(msg tea.KeyMsg) model {
 		m.renameNodePath = node.path
 		m.renameIsFolder = node.isFolder
 		m.statusMessage = "Rename: type new name, Enter to save, Esc to cancel"
+		return m
+	case "/":
+		if inInsert {
+			break
+		}
+		m.searchMode = true
+		m.searchInput.Focus()
+		m.searchInput.SetValue("")
+		m.statusMessage = "Search mode - type to filter notes"
+		return m
+	case "m":
+		if inInsert || m.activePanel != panelEditor {
+			break
+		}
+		if m.layoutMode == modePreview {
+			m.layoutMode = modeSplit
+			m.statusMessage = "Split mode"
+		} else {
+			m.updatePreview()
+			m.layoutMode = modePreview
+			m.statusMessage = "Markdown preview mode"
+		}
 		return m
 	case "v":
 		if inInsert {
@@ -378,6 +519,80 @@ func (m model) handleRenameKey(msg tea.KeyMsg) model {
 		return m
 	}
 	return m
+}
+
+func (m model) handleSearchKey(msg tea.KeyMsg) model {
+	switch msg.Type {
+	case tea.KeyEsc:
+		m.searchMode = false
+		m.searchInput.Blur()
+		m.searchInput.SetValue("")
+		m.searchResults = nil
+		m.statusMessage = "Search closed"
+		return m
+	case tea.KeyEnter:
+		if len(m.searchResults) > 0 {
+			path := m.allNotes[m.searchResults[0].Index].path
+			m.selectedPath = path
+			m.activePanel = panelEditor
+			_ = m.reloadTree()
+			m.searchMode = false
+			m.searchInput.Blur()
+			m.searchResults = nil
+			m.statusMessage = "Opened search result"
+		}
+		return m
+	}
+
+	var cmd tea.Cmd
+	m.searchInput, cmd = m.searchInput.Update(msg)
+
+	query := m.searchInput.Value()
+	if query != "" {
+		names := make([]string, len(m.allNotes))
+		for i, n := range m.allNotes {
+			names[i] = n.name
+		}
+		m.searchResults = fuzzy.Find(query, names)
+	} else {
+		m.searchResults = nil
+	}
+
+	_ = cmd
+	return m
+}
+
+func (m *model) updatePreview() {
+	if m.glamourRender == nil {
+		return
+	}
+	content := m.editor.content()
+	if content == "" {
+		m.previewContent = ""
+		return
+	}
+	rendered, err := m.glamourRender.Render(content)
+	if err != nil {
+		m.previewContent = content
+		return
+	}
+	m.previewContent = rendered
+}
+
+func (m *model) collectAllNotes() {
+	nodes, _ := m.storage.loadTree()
+	m.allNotes = nil
+	m.collectNotesFromNodes(nodes)
+}
+
+func (m *model) collectNotesFromNodes(nodes []*browserNode) {
+	for _, n := range nodes {
+		if n.isFolder {
+			m.collectNotesFromNodes(n.children)
+		} else {
+			m.allNotes = append(m.allNotes, noteEntry{path: n.path, name: n.name})
+		}
+	}
 }
 
 func (m model) handleBrowserKey(msg tea.KeyMsg) model {
@@ -575,6 +790,9 @@ func (m *model) saveCurrentNote() {
 		return
 	}
 	m.editor.dirty = false
+	if m.layoutMode == modePreview {
+		m.updatePreview()
+	}
 }
 
 func (m *model) togglePanel() {
@@ -693,17 +911,34 @@ func (m model) View() string {
 		return ""
 	}
 
+	if m.splashPhase < 3 {
+		return m.renderSplash()
+	}
+
 	contentWidth := max(20, m.width-(appPadX*2))
-	top := ""
 	status := m.renderStatus(contentWidth)
-	availableHeight := m.height - lipgloss.Height(top) - lipgloss.Height(status)
-	if availableHeight < 8 {
-		availableHeight = 8
+	availableHeight := m.height - lipgloss.Height(status)
+	if availableHeight < 10 {
+		availableHeight = 10
 	}
 
 	body := ""
 	if m.layoutMode == modeZen {
 		body = m.renderEditorPanel(contentWidth, availableHeight)
+	} else if m.layoutMode == modePreview {
+		gap := panelGap
+		browserWidth := max(28, contentWidth/4)
+		editorWidth := (contentWidth - browserWidth - gap) / 2
+		previewWidth := contentWidth - browserWidth - editorWidth - gap*2
+		if editorWidth < 30 {
+			editorWidth = 30
+			browserWidth = max(20, (contentWidth-editorWidth*2-gap*2)/2)
+			previewWidth = editorWidth
+		}
+		browser := m.renderBrowserPanel(browserWidth, availableHeight)
+		editor := m.renderEditorPanel(editorWidth, availableHeight)
+		preview := m.renderPreviewPanel(previewWidth, availableHeight)
+		body = lipgloss.JoinHorizontal(lipgloss.Top, browser, "  ", editor, "  ", preview)
 	} else {
 		gap := panelGap
 		browserWidth := max(28, contentWidth/3)
@@ -724,15 +959,32 @@ func (m model) View() string {
 		body = lipgloss.JoinHorizontal(lipgloss.Top, browser, "  ", editor)
 	}
 
-	root := lipgloss.JoinVertical(lipgloss.Left, top, body, status)
+	root := lipgloss.JoinVertical(lipgloss.Left, body, status)
 	if m.showHelp {
 		return m.styles.app.Render(m.renderHelpPanel(contentWidth))
+	}
+	if m.searchMode {
+		root = m.overlaySearch(root, contentWidth)
 	}
 	return m.styles.app.Render(root)
 }
 
+func (m model) renderSplash() string {
+	frames := []string{
+		"BLOB",
+		"BLOB .",
+		"BLOB . .",
+		"BLOB . . .",
+	}
+	frame := m.splashPhase
+	if frame >= len(frames) {
+		frame = len(frames) - 1
+	}
+	text := frames[frame]
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, m.styles.splash.Render(text))
+}
+
 func (m model) renderTopbar(width int) string {
-	innerWidth := max(10, width-4)
 	left := m.styles.title.Render("BLOB")
 	modeTag := m.styles.badge.Render(modeLabel(m.layoutMode))
 	focusTag := m.styles.badge.Render(labelForPanel(m.activePanel))
@@ -740,13 +992,60 @@ func (m model) renderTopbar(width int) string {
 	if m.editor.vimEnabled {
 		vimTag = m.styles.badgeActive.Render("vim on")
 	}
-	right := lipgloss.JoinHorizontal(lipgloss.Left, modeTag, " ", focusTag, " ", vimTag)
+	right := lipgloss.JoinHorizontal(lipgloss.Left, modeTag, "  ", focusTag, "  ", vimTag)
+	content := lipgloss.JoinHorizontal(lipgloss.Left, left, "  ", right)
+	return m.styles.topbar.Width(width).Render(content)
+}
 
-	titleRow := left
-	if lipgloss.Width(left)+lipgloss.Width(right)+1 <= innerWidth {
-		titleRow = left + strings.Repeat(" ", innerWidth-lipgloss.Width(left)-lipgloss.Width(right)) + right
+func min(a, b int) int {
+	if a < b {
+		return a
 	}
-	return m.styles.topbar.Width(width).Render(titleRow)
+	return b
+}
+
+func (m model) overlaySearch(content string, width int) string {
+	searchBox := m.styles.searchBox.Width(min(width-10, 50)).Render(m.searchInput.View())
+	results := ""
+	if len(m.searchResults) > 0 {
+		lines := []string{}
+		for i, r := range m.searchResults {
+			if i >= 5 {
+				break
+			}
+			name := m.allNotes[r.Index].name
+			if i == 0 {
+				lines = append(lines, m.styles.itemSelected.Render(name))
+			} else {
+				lines = append(lines, m.styles.item.Render(name))
+			}
+		}
+		results = strings.Join(lines, "\n")
+	} else if m.searchInput.Value() != "" {
+		results = m.styles.empty.Render("No results")
+	}
+	searchPanel := lipgloss.JoinVertical(lipgloss.Left, searchBox, results)
+	return lipgloss.Place(width, m.height, lipgloss.Center, lipgloss.Center, searchPanel)
+}
+
+func (m model) renderPreviewPanel(width, height int) string {
+	style := m.styles.previewBox.Width(width).Height(height)
+	if m.activePanel == panelPreview {
+		style = m.styles.panelFocused.Width(width).Height(height)
+	}
+	node := m.currentNode()
+	title := "Preview"
+	if node != nil && !node.isFolder {
+		title = node.name + " (preview)"
+	}
+	header := m.styles.panelTitle.Render(truncateToWidth(title, width-4))
+	lines := []string{header, ""}
+	if m.previewContent == "" {
+		lines = append(lines, m.styles.empty.Render("Press m to preview markdown"))
+	} else {
+		lines = append(lines, m.previewContent)
+	}
+	return style.Render(strings.Join(lines, "\n"))
 }
 
 func joinBar(left, right string, width int) string {
@@ -790,17 +1089,22 @@ func (m model) renderBrowserPanel(width, height int) string {
 		item := m.visible[i]
 		indent := strings.Repeat("  ", item.depth)
 		label := item.node.name
+		icon := ""
 		if item.node.isFolder {
-			marker := ">"
-			if !item.node.collapsed {
-				marker = "v"
+			if item.node.collapsed {
+				icon = m.styles.iconFolder.Render("+")
+			} else {
+				icon = m.styles.iconFolder.Render("-")
 			}
-			label = marker + " " + label
+			label = icon + " " + label
+		} else {
+			icon = m.styles.iconNote.Render("•")
+			label = icon + " " + label
 		}
 
 		row := indent + label
 		if i == m.selected {
-			lines = append(lines, m.styles.itemSelected.Width(max(1, width-6)).Render(row))
+			lines = append(lines, m.styles.itemSelected.Render(row))
 			continue
 		}
 
@@ -876,7 +1180,7 @@ func (m model) renderStatus(width int) string {
 		right := m.styles.help.Render("Name: " + truncateToWidth(m.renameInput, max(10, innerWidth/2)))
 		return m.styles.statusBar.Width(width).Render(joinBar(left, right, innerWidth))
 	}
-	right := m.styles.help.Render("n note  N folder  r rename  d delete  p/tab panel  z zen  h help")
+	right := m.styles.help.Render("n note  N folder  r rename  d delete  p/tab panel  / search  m preview  h help")
 	content := joinBar(left, right, innerWidth)
 	return m.styles.statusBar.Width(width).Render(content)
 }
@@ -892,7 +1196,8 @@ func (m model) renderHelpPanel(width int) string {
 		m.styles.item.Render("d               delete selected note/folder"),
 		m.styles.item.Render("p / tab         switch panel"),
 		m.styles.item.Render("z               toggle zen"),
-		m.styles.item.Render("Shift+Enter / Ctrl+Enter   zen fallback"),
+		m.styles.item.Render("/               search notes"),
+		m.styles.item.Render("m               markdown preview"),
 		m.styles.item.Render("v               vim on/off"),
 		m.styles.item.Render("h / H / Ctrl+H  help"),
 		m.styles.item.Render("q               quit (normal mode)"),
@@ -978,8 +1283,11 @@ func truncateToWidth(s string, width int) string {
 }
 
 func modeLabel(v mode) string {
-	if v == modeZen {
+	switch v {
+	case modeZen:
 		return "zen"
+	case modePreview:
+		return "preview"
 	}
 	return "split"
 }
@@ -992,8 +1300,11 @@ func onOff(enabled bool) string {
 }
 
 func labelForPanel(v panel) string {
-	if v == panelEditor {
+	switch v {
+	case panelEditor:
 		return "editor"
+	case panelPreview:
+		return "preview"
 	}
 	return "browser"
 }
