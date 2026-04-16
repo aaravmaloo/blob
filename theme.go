@@ -11,10 +11,10 @@ var cssVarPattern = regexp.MustCompile(`--([a-z0-9-]+)\s*:\s*(#[0-9a-fA-F]{6})\s
 
 func loadThemeVars() map[string]string {
 	vars := map[string]string{
-		"surface":       "#0d0d12",
-		"panel-surface": "#13131f",
-		"panel-edge":    "#2d2d44",
-		"panel-glow":    "#7c3aed",
+		"surface":       "#000000",
+		"panel-surface": "#000000",
+		"panel-edge":    "#7c3aed",
+		"panel-glow":    "#a78bfa",
 		"ink":           "#e2e8f0",
 		"muted":         "#64748b",
 		"accent":        "#a78bfa",
@@ -53,8 +53,7 @@ func loadThemeVars() map[string]string {
 		val := strings.TrimSpace(m[2])
 		vars[key] = val
 	}
-	// Enforce dark theme base.
-	vars["surface"] = "#0d0d12"
-	vars["panel-surface"] = "#13131f"
+	vars["surface"] = "#000000"
+	vars["panel-surface"] = "#000000"
 	return vars
 }
