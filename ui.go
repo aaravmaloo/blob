@@ -36,6 +36,7 @@ type visibleNode struct {
 
 type model struct {
 	storage *storage
+	locks   *lockStore
 
 	width  int
 	height int
@@ -68,6 +69,13 @@ type model struct {
 	splashPhase    int
 	splashStart    time.Time
 	frame          int
+
+	appLocked      bool
+	lockPrompt     bool
+	lockTarget     string
+	lockInput      string
+	lockIsSet      bool
+	lockConfirm    string
 
 	styles uiStyles
 }
@@ -105,6 +113,8 @@ type uiStyles struct {
 	searchBox    lipgloss.Style
 	splash       lipgloss.Style
 	previewBox   lipgloss.Style
+	lockPrompt   lipgloss.Style
+	lockIcon     lipgloss.Style
 }
 
 const (
@@ -128,8 +138,11 @@ func newModel(storage *storage) (model, error) {
 		glamour.WithWordWrap(80),
 	)
 
+	locks := newLockStore(storage.rootDir)
+
 	m := model{
 		storage:        storage,
+		locks:          locks,
 		activePanel:    panelBrowser,
 		layoutMode:     modeSplit,
 		zenArmed:       false,
@@ -142,6 +155,12 @@ func newModel(storage *storage) (model, error) {
 		splashPhase:    0,
 		splashStart:    time.Now(),
 		frame:          0,
+		appLocked:      locks.IsAppLocked(),
+		lockPrompt:     locks.IsAppLocked(),
+		lockTarget:     "app",
+		lockInput:      "",
+		lockIsSet:      false,
+		lockConfirm:    "",
 	}
 	m.styles = buildStyles()
 	m.collectAllNotes()
@@ -291,6 +310,16 @@ func buildStyles() uiStyles {
 			Border(lipgloss.RoundedBorder()).
 			BorderForeground(panelGlow).
 			Padding(1),
+		lockPrompt: lipgloss.NewStyle().
+			Background(panelSurface).
+			Foreground(ink).
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(panelGlow).
+			Padding(1, 2).
+			Align(lipgloss.Center),
+		lockIcon: lipgloss.NewStyle().
+			Foreground(gold).
+			Bold(true),
 	}
 }
 
@@ -332,6 +361,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m model) handleKey(msg tea.KeyMsg) model {
 	key := msg.String()
+
+	if m.lockPrompt {
+		return m.handleLockKey(msg)
+	}
+
+	if m.appLocked {
+		return m
+	}
+
 	inInsert := m.activePanel == panelEditor && (!m.editor.vimEnabled || m.editor.mode == editorModeInsert)
 
 	if m.searchMode {
@@ -444,6 +482,47 @@ func (m model) handleKey(msg tea.KeyMsg) model {
 			m.statusMessage = "Vim editing disabled"
 		}
 		return m
+	case "L":
+		if inInsert {
+			break
+		}
+		node := m.currentNode()
+		if node == nil {
+			return m
+		}
+		if m.locks.IsItemLocked(node.path) {
+			m.locks.UnlockItem(node.path)
+			m.statusMessage = "Unlocked: " + node.name
+			return m
+		}
+		m.lockPrompt = true
+		m.lockTarget = node.path
+		m.lockInput = ""
+		m.lockIsSet = true
+		m.lockConfirm = ""
+		m.statusMessage = "Set password for " + node.name
+		return m
+	case "ctrl+l":
+		if inInsert {
+			break
+		}
+		if m.locks.IsAppLocked() {
+			m.appLocked = true
+			m.lockPrompt = true
+			m.lockTarget = "app"
+			m.lockInput = ""
+			m.lockIsSet = false
+			m.lockConfirm = ""
+			m.statusMessage = "App locked - enter password"
+		} else {
+			m.lockPrompt = true
+			m.lockTarget = "app:set"
+			m.lockInput = ""
+			m.lockIsSet = true
+			m.lockConfirm = ""
+			m.statusMessage = "Set app password"
+		}
+		return m
 	case "ctrl+n":
 		if err := m.createNote(); err != nil {
 			m.statusMessage = err.Error()
@@ -482,6 +561,98 @@ func (m model) handleKey(msg tea.KeyMsg) model {
 		return m.handleBrowserKey(msg)
 	}
 	return m.handleEditorKey(msg)
+}
+
+func (m model) handleLockKey(msg tea.KeyMsg) model {
+	switch msg.Type {
+	case tea.KeyEsc:
+		m.lockPrompt = false
+		m.lockInput = ""
+		m.lockConfirm = ""
+		m.lockTarget = ""
+		m.statusMessage = "Cancelled"
+		return m
+	case tea.KeyEnter:
+		if m.lockIsSet && m.lockConfirm == "" {
+			m.lockConfirm = m.lockInput
+			m.lockInput = ""
+			m.statusMessage = "Confirm password"
+			return m
+		}
+		if m.lockIsSet && m.lockConfirm != "" {
+			if m.lockInput != m.lockConfirm {
+				m.lockPrompt = false
+				m.lockInput = ""
+				m.lockConfirm = ""
+				m.lockTarget = ""
+				m.statusMessage = "Passwords did not match"
+				return m
+			}
+			if m.lockTarget == "app:set" {
+				if err := m.locks.SetAppLock(m.lockInput); err != nil {
+					m.statusMessage = err.Error()
+				} else {
+					m.statusMessage = "App password set"
+				}
+			} else {
+				if err := m.locks.LockItem(m.lockTarget, m.lockInput); err != nil {
+					m.statusMessage = err.Error()
+				} else {
+					m.statusMessage = "Locked"
+				}
+			}
+			m.lockPrompt = false
+			m.lockInput = ""
+			m.lockConfirm = ""
+			m.lockTarget = ""
+			return m
+		}
+		if m.lockTarget == "app" {
+			if m.locks.CheckAppPassword(m.lockInput) {
+				m.appLocked = false
+				m.lockPrompt = false
+				m.lockInput = ""
+				m.lockTarget = ""
+				m.statusMessage = "App unlocked"
+			} else {
+				m.lockInput = ""
+				m.statusMessage = "Wrong password"
+			}
+			return m
+		}
+		if m.locks.CheckItemPassword(m.lockTarget, m.lockInput) {
+			m.lockPrompt = false
+			m.lockInput = ""
+			unlockedPath := m.lockTarget
+			m.lockTarget = ""
+			m.statusMessage = "Unlocked"
+			node := m.currentNode()
+			if node != nil && node.path == unlockedPath {
+				if node.isFolder {
+					node.collapsed = !node.collapsed
+					m.collapsed[node.path] = node.collapsed
+					_ = m.reloadTree()
+				} else {
+					m.activePanel = panelEditor
+					m.statusMessage = "Editor focused"
+				}
+			}
+		} else {
+			m.lockInput = ""
+			m.statusMessage = "Wrong password"
+		}
+		return m
+	case tea.KeyBackspace:
+		if len(m.lockInput) > 0 {
+			r := []rune(m.lockInput)
+			m.lockInput = string(r[:len(r)-1])
+		}
+		return m
+	case tea.KeyRunes:
+		m.lockInput += string(msg.Runes)
+		return m
+	}
+	return m
 }
 
 func (m model) handleRenameKey(msg tea.KeyMsg) model {
@@ -608,6 +779,16 @@ func (m model) handleBrowserKey(msg tea.KeyMsg) model {
 	case "enter":
 		node := m.currentNode()
 		if node == nil {
+			return m
+		}
+		if m.locks.IsItemLocked(node.path) {
+			m.lockPrompt = true
+			m.lockTarget = node.path
+			m.lockInput = ""
+			m.lockIsSet = false
+			m.lockConfirm = ""
+			m.statusMessage = "Locked - enter password"
+			m.syncSelection()
 			return m
 		}
 		if node.isFolder {
@@ -960,6 +1141,12 @@ func (m model) View() string {
 	}
 
 	root := lipgloss.JoinVertical(lipgloss.Left, body, status)
+	if m.appLocked && !m.lockPrompt {
+		return m.styles.app.Render(m.renderAppLockScreen(contentWidth))
+	}
+	if m.lockPrompt {
+		return m.styles.app.Render(m.renderLockPrompt(contentWidth))
+	}
 	if m.showHelp {
 		return m.styles.app.Render(m.renderHelpPanel(contentWidth))
 	}
@@ -982,6 +1169,34 @@ func (m model) renderSplash() string {
 	}
 	text := frames[frame]
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, m.styles.splash.Render(text))
+}
+
+func (m model) renderAppLockScreen(width int) string {
+	lockIcon := m.styles.lockIcon.Render("[LOCKED]")
+	title := m.styles.title.Render("BLOB is locked")
+	hint := m.styles.help.Render("Press Ctrl+L to unlock")
+	content := lipgloss.JoinVertical(lipgloss.Center, lockIcon, "", title, "", hint)
+	box := m.styles.lockPrompt.Width(min(width-10, 40)).Render(content)
+	return lipgloss.Place(width, m.height, lipgloss.Center, lipgloss.Center, box)
+}
+
+func (m model) renderLockPrompt(width int) string {
+	maskedInput := strings.Repeat("*", len(m.lockInput))
+	label := "Enter password"
+	if m.lockIsSet && m.lockConfirm != "" {
+		label = "Confirm password"
+	} else if m.lockIsSet {
+		label = "Set password"
+	}
+	lockIcon := m.styles.lockIcon.Render("[LOCK]")
+	promptLabel := m.styles.panelTitle.Render(label)
+	input := m.styles.editorText.Render(maskedInput)
+	cursor := m.styles.editorCursor.Render(" ")
+	hint := m.styles.help.Render("Enter to confirm, Esc to cancel")
+	statusLine := m.styles.help.Render(m.statusMessage)
+	content := lipgloss.JoinVertical(lipgloss.Center, lockIcon, "", promptLabel, "", input+cursor, "", hint, statusLine)
+	box := m.styles.lockPrompt.Width(min(width-10, 40)).Render(content)
+	return lipgloss.Place(width, m.height, lipgloss.Center, lipgloss.Center, box)
 }
 
 func (m model) renderTopbar(width int) string {
@@ -1101,6 +1316,9 @@ func (m model) renderBrowserPanel(width, height int) string {
 			icon = m.styles.iconNote.Render("•")
 			label = icon + " " + label
 		}
+		if m.locks.IsItemLocked(item.node.path) {
+			label += " " + m.styles.lockIcon.Render("[*]")
+		}
 
 		row := indent + label
 		if i == m.selected {
@@ -1180,7 +1398,7 @@ func (m model) renderStatus(width int) string {
 		right := m.styles.help.Render("Name: " + truncateToWidth(m.renameInput, max(10, innerWidth/2)))
 		return m.styles.statusBar.Width(width).Render(joinBar(left, right, innerWidth))
 	}
-	right := m.styles.help.Render("n note  N folder  r rename  d delete  p/tab panel  / search  m preview  h help")
+	right := m.styles.help.Render("n note  N folder  r rename  d delete  L lock  Ctrl+L app lock  / search  m preview  h help")
 	content := joinBar(left, right, innerWidth)
 	return m.styles.statusBar.Width(width).Render(content)
 }
@@ -1199,6 +1417,8 @@ func (m model) renderHelpPanel(width int) string {
 		m.styles.item.Render("/               search notes"),
 		m.styles.item.Render("m               markdown preview"),
 		m.styles.item.Render("v               vim on/off"),
+		m.styles.item.Render("L               lock/unlock item"),
+		m.styles.item.Render("Ctrl+L          lock/unlock app"),
 		m.styles.item.Render("h / H / Ctrl+H  help"),
 		m.styles.item.Render("q               quit (normal mode)"),
 		"",
