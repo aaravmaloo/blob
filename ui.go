@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -37,6 +38,7 @@ type visibleNode struct {
 type model struct {
 	storage *storage
 	locks   *lockStore
+	meta    *metaStore
 
 	width  int
 	height int
@@ -76,6 +78,23 @@ type model struct {
 	lockInput      string
 	lockIsSet      bool
 	lockConfirm    string
+
+	// Scratch Pad
+	scratchMode  bool
+	scratchInput textinput.Model
+
+	// Quick Note Linking
+	linkMode    bool
+	linkInput   textinput.Model
+	linkResults []fuzzy.Match
+
+	// Archive visibility
+	showArchived bool
+
+	// Template picker
+	templateMode    bool
+	templateInput   textinput.Model
+	templateResults []fuzzy.Match
 
 	styles uiStyles
 }
@@ -133,16 +152,33 @@ func newModel(storage *storage) (model, error) {
 	searchInput.CharLimit = 50
 	searchInput.Width = 30
 
+	scratchInput := textinput.New()
+	scratchInput.Placeholder = "Jot a thought..."
+	scratchInput.CharLimit = 500
+	scratchInput.Width = 60
+
+	linkInput := textinput.New()
+	linkInput.Placeholder = "Find note to link..."
+	linkInput.CharLimit = 50
+	linkInput.Width = 30
+
+	templateInput := textinput.New()
+	templateInput.Placeholder = "Pick a template..."
+	templateInput.CharLimit = 50
+	templateInput.Width = 30
+
 	gr, _ := glamour.NewTermRenderer(
 		glamour.WithAutoStyle(),
 		glamour.WithWordWrap(80),
 	)
 
 	locks := newLockStore(storage.rootDir)
+	meta := newMetaStore(storage.rootDir)
 
 	m := model{
 		storage:        storage,
 		locks:          locks,
+		meta:           meta,
 		activePanel:    panelBrowser,
 		layoutMode:     modeSplit,
 		zenArmed:       false,
@@ -151,6 +187,9 @@ func newModel(storage *storage) (model, error) {
 		collapsed:      make(map[string]bool),
 		showChromeHint: true,
 		searchInput:    searchInput,
+		scratchInput:   scratchInput,
+		linkInput:      linkInput,
+		templateInput:  templateInput,
 		glamourRender:  gr,
 		splashPhase:    0,
 		splashStart:    time.Now(),
@@ -343,6 +382,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.searchInput.Width = max(20, m.width/3)
+		m.scratchInput.Width = max(20, m.width/2)
+		m.linkInput.Width = max(20, m.width/3)
+		m.templateInput.Width = max(20, m.width/3)
 		return m, nil
 	case tickMsg:
 		m.frame++
@@ -371,6 +413,18 @@ func (m model) handleKey(msg tea.KeyMsg) model {
 	}
 
 	inInsert := m.activePanel == panelEditor && (!m.editor.vimEnabled || m.editor.mode == editorModeInsert)
+
+	if m.scratchMode {
+		return m.handleScratchKey(msg)
+	}
+
+	if m.linkMode {
+		return m.handleLinkKey(msg)
+	}
+
+	if m.templateMode {
+		return m.handleTemplateKey(msg)
+	}
 
 	if m.searchMode {
 		return m.handleSearchKey(msg)
@@ -554,6 +608,78 @@ func (m model) handleKey(msg tea.KeyMsg) model {
 		} else {
 			m.statusMessage = "Vim editing disabled"
 		}
+		return m
+	case "s":
+		if inInsert {
+			break
+		}
+		m.scratchMode = true
+		m.scratchInput.Focus()
+		m.scratchInput.SetValue(m.meta.LoadScratch())
+		m.statusMessage = "Scratch pad - type thoughts, s to save & close"
+		return m
+	case ".":
+		if inInsert || m.activePanel != panelBrowser {
+			break
+		}
+		node := m.currentNode()
+		if node == nil || node.isFolder {
+			return m
+		}
+		pinned := m.meta.TogglePin(node.path)
+		if pinned {
+			m.statusMessage = "Pinned: " + node.name
+		} else {
+			m.statusMessage = "Unpinned: " + node.name
+		}
+		_ = m.reloadTree()
+		return m
+	case "A":
+		if inInsert {
+			break
+		}
+		m.showArchived = !m.showArchived
+		if m.showArchived {
+			m.statusMessage = "Showing archived notes"
+		} else {
+			m.statusMessage = "Hiding archived notes"
+		}
+		_ = m.reloadTree()
+		return m
+	case "ctrl+k":
+		if inInsert {
+			break
+		}
+		m.linkMode = true
+		m.linkInput.Focus()
+		m.linkInput.SetValue("")
+		m.linkResults = nil
+		m.statusMessage = "Link note - type to find, Enter to insert [[link]]"
+		return m
+	case "t":
+		if inInsert || m.activePanel != panelBrowser {
+			break
+		}
+		templates := m.meta.ListTemplates()
+		if len(templates) == 0 {
+			m.statusMessage = "No templates - create one with T"
+			return m
+		}
+		m.templateMode = true
+		m.templateInput.Focus()
+		m.templateInput.SetValue("")
+		m.templateResults = nil
+		m.statusMessage = "Pick a template - type to filter, Enter to use"
+		return m
+	case "T":
+		if inInsert || m.activePanel != panelBrowser {
+			break
+		}
+		m.templateMode = true
+		m.templateInput.Focus()
+		m.templateInput.SetValue("")
+		m.templateResults = nil
+		m.statusMessage = "Template mode - Enter to create from current note, Esc to cancel"
 		return m
 	}
 
@@ -810,6 +936,19 @@ func (m model) handleBrowserKey(msg tea.KeyMsg) model {
 			return m
 		}
 		m.toggleZenFromSelection()
+	case "a":
+		node := m.currentNode()
+		if node == nil || node.isFolder {
+			return m
+		}
+		archived := m.meta.ToggleArchive(node.path)
+		if archived {
+			m.statusMessage = "Archived: " + node.name
+		} else {
+			m.statusMessage = "Unarchived: " + node.name
+		}
+		_ = m.reloadTree()
+		return m
 	}
 	m.syncSelection()
 	return m
@@ -997,6 +1136,10 @@ func (m *model) reloadTree() error {
 		return err
 	}
 	applyCollapsedState(nodes, m.collapsed)
+	if !m.showArchived {
+		nodes = filterArchived(nodes, m.meta)
+	}
+	sortPinnedToTop(nodes, m.meta)
 	m.rootNodes = nodes
 	m.visible = flattenNodes(nodes, 0)
 	if len(m.visible) == 0 {
@@ -1057,6 +1200,8 @@ func (m *model) syncSelection() error {
 	if node.isFolder {
 		return nil
 	}
+
+	m.meta.TouchRecent(node.path, node.name)
 
 	content, err := m.storage.readNote(node.path)
 	if err != nil {
@@ -1153,6 +1298,15 @@ func (m model) View() string {
 	if m.searchMode {
 		root = m.overlaySearch(root, contentWidth)
 	}
+	if m.scratchMode {
+		root = m.overlayScratch(root, contentWidth)
+	}
+	if m.linkMode {
+		root = m.overlayLink(root, contentWidth)
+	}
+	if m.templateMode {
+		root = m.overlayTemplate(root, contentWidth)
+	}
 	return m.styles.app.Render(root)
 }
 
@@ -1243,6 +1397,89 @@ func (m model) overlaySearch(content string, width int) string {
 	return lipgloss.Place(width, m.height, lipgloss.Center, lipgloss.Center, searchPanel)
 }
 
+func (m model) overlayScratch(content string, width int) string {
+	boxWidth := min(width-10, 60)
+	title := m.styles.panelTitle.Render("Scratch Pad")
+	hint := m.styles.help.Render("s save & close | esc cancel")
+	input := m.styles.searchBox.Width(boxWidth).Render(m.scratchInput.View())
+	savedContent := m.meta.LoadScratch()
+	preview := ""
+	if savedContent != "" {
+		lines := strings.Split(savedContent, "\n")
+		showLines := min(5, len(lines))
+		previewLines := make([]string, showLines)
+		for i := 0; i < showLines; i++ {
+			previewLines[i] = truncateToWidth(lines[i], boxWidth-4)
+		}
+		preview = m.styles.itemMuted.Render(strings.Join(previewLines, "\n"))
+	}
+	panel := lipgloss.JoinVertical(lipgloss.Left, title, hint, "", input, "", preview)
+	return lipgloss.Place(width, m.height, lipgloss.Center, lipgloss.Center, panel)
+}
+
+func (m model) overlayLink(content string, width int) string {
+	boxWidth := min(width-10, 50)
+	title := m.styles.panelTitle.Render("Link Note")
+	hint := m.styles.help.Render("Enter to insert [[link]] | esc cancel | ↓ next")
+	input := m.styles.searchBox.Width(boxWidth).Render(m.linkInput.View())
+	results := ""
+	if len(m.linkResults) > 0 {
+		lines := []string{}
+		for i, r := range m.linkResults {
+			if i >= 5 {
+				break
+			}
+			name := m.allNotes[r.Index].name
+			if i == 0 {
+				lines = append(lines, m.styles.itemSelected.Render("[["+name+"]]"))
+			} else {
+				lines = append(lines, m.styles.item.Render(name))
+			}
+		}
+		results = strings.Join(lines, "\n")
+	} else if m.linkInput.Value() != "" {
+		results = m.styles.empty.Render("No results")
+	}
+	panel := lipgloss.JoinVertical(lipgloss.Left, title, hint, "", input, "", results)
+	return lipgloss.Place(width, m.height, lipgloss.Center, lipgloss.Center, panel)
+}
+
+func (m model) overlayTemplate(content string, width int) string {
+	boxWidth := min(width-10, 50)
+	title := m.styles.panelTitle.Render("Templates")
+	hint := m.styles.help.Render("t use template | T save current as template | esc cancel")
+	input := m.styles.searchBox.Width(boxWidth).Render(m.templateInput.View())
+	results := ""
+	templates := m.meta.ListTemplates()
+	if len(m.templateResults) > 0 {
+		lines := []string{}
+		for i, r := range m.templateResults {
+			if i >= 5 {
+				break
+			}
+			name := templates[r.Index]
+			if i == 0 {
+				lines = append(lines, m.styles.itemSelected.Render(name))
+			} else {
+				lines = append(lines, m.styles.item.Render(name))
+			}
+		}
+		results = strings.Join(lines, "\n")
+	} else if m.templateInput.Value() != "" {
+		results = m.styles.empty.Render("No matching templates")
+	} else if len(templates) > 0 {
+		lines := make([]string, min(5, len(templates)))
+		for i := range lines {
+			lines[i] = m.styles.item.Render(templates[i])
+		}
+		results = strings.Join(lines, "\n")
+	} else {
+		results = m.styles.empty.Render("No templates yet - press T to save one")
+	}
+	panel := lipgloss.JoinVertical(lipgloss.Left, title, hint, "", input, "", results)
+	return lipgloss.Place(width, m.height, lipgloss.Center, lipgloss.Center, panel)
+}
+
 func (m model) renderPreviewPanel(width, height int) string {
 	style := m.styles.previewBox.Width(width).Height(height)
 	if m.activePanel == panelPreview {
@@ -1287,12 +1524,37 @@ func (m model) renderBrowserPanel(width, height int) string {
 		"",
 	}
 
+	// Recent notes section
+	recent := m.meta.GetRecent()
+	if len(recent) > 0 {
+		lines = append(lines, m.styles.panelMeta.Render("Recent"))
+		showCount := min(5, len(recent))
+		for i := 0; i < showCount; i++ {
+			r := recent[i]
+			prefix := m.styles.iconNote.Render("•")
+			name := truncateToWidth(r.Name, max(1, width-6))
+			row := prefix + " " + name
+			if r.Path == m.selectedPath {
+				row = m.styles.itemSelected.Render(" " + row)
+			} else {
+				row = m.styles.itemMuted.Render(" " + row)
+			}
+			lines = append(lines, row)
+		}
+		lines = append(lines, "")
+	}
+
 	if len(m.visible) == 0 {
 		lines = append(lines, m.styles.empty.Render("Press Ctrl+N to create a note"))
 		return style.Render(strings.Join(lines, "\n"))
 	}
 
-	maxLines := max(3, height-4)
+	// Reserve space for recent section
+	recentLines := 0
+	if len(recent) > 0 {
+		recentLines = min(5, len(recent)) + 2 // +2 for header and blank line
+	}
+	maxLines := max(3, height-4-recentLines)
 	if m.selected < m.browserScroll {
 		m.browserScroll = m.selected
 	}
@@ -1300,7 +1562,7 @@ func (m model) renderBrowserPanel(width, height int) string {
 		m.browserScroll = m.selected - maxLines + 1
 	}
 
-	for i := m.browserScroll; i < len(m.visible) && len(lines) < maxLines+2; i++ {
+	for i := m.browserScroll; i < len(m.visible) && len(lines)-recentLines < maxLines+2; i++ {
 		item := m.visible[i]
 		indent := strings.Repeat("  ", item.depth)
 		label := item.node.name
@@ -1313,11 +1575,18 @@ func (m model) renderBrowserPanel(width, height int) string {
 			}
 			label = icon + " " + label
 		} else {
-			icon = m.styles.iconNote.Render("•")
+			if m.meta.IsPinned(item.node.path) {
+				icon = m.styles.badgeGold.Render("★")
+			} else {
+				icon = m.styles.iconNote.Render("•")
+			}
 			label = icon + " " + label
 		}
 		if m.locks.IsItemLocked(item.node.path) {
 			label += " " + m.styles.lockIcon.Render("[*]")
+		}
+		if m.meta.IsArchived(item.node.path) {
+			label += " " + m.styles.itemMuted.Render("[archived]")
 		}
 
 		row := indent + label
@@ -1378,7 +1647,10 @@ func (m model) renderEditorPanel(width, height int) string {
 	if m.editor.mode == editorModeNormal {
 		currentMode = "NORMAL"
 	}
-	lines = append(lines, m.styles.help.Render(currentMode))
+	s := computeStats(m.editor.content())
+	statsLine := fmt.Sprintf("%dw | %dc | %dl | ~%s", s.Words, s.Chars, s.Lines, s.ReadingTime)
+	footer := joinBar(currentMode, statsLine, max(1, width-4))
+	lines = append(lines, m.styles.help.Render(footer))
 
 	return style.Render(strings.Join(lines, "\n"))
 }
@@ -1392,13 +1664,21 @@ func (m model) renderStatus(width int) string {
 	layout := modeLabel(m.layoutMode)
 	focus := labelForPanel(m.activePanel)
 	vim := onOff(m.editor.vimEnabled)
-	leftRaw := "status: " + m.statusMessage + " | layout: " + layout + " | focus: " + focus + " | vim: " + vim + " | mode: " + mode
+
+	// Compute stats for current note
+	statsStr := ""
+	if m.selectedPath != "" && m.activePanel == panelEditor {
+		s := computeStats(m.editor.content())
+		statsStr = fmt.Sprintf(" | %dw %dc %dl ~%s", s.Words, s.Chars, s.Lines, s.ReadingTime)
+	}
+
+	leftRaw := "status: " + m.statusMessage + statsStr + " | layout: " + layout + " | focus: " + focus + " | vim: " + vim + " | mode: " + mode
 	left := truncateToWidth(leftRaw, innerWidth)
 	if m.renaming {
 		right := m.styles.help.Render("Name: " + truncateToWidth(m.renameInput, max(10, innerWidth/2)))
 		return m.styles.statusBar.Width(width).Render(joinBar(left, right, innerWidth))
 	}
-	right := m.styles.help.Render("n note  N folder  r rename  d delete  L lock  Ctrl+L app lock  / search  m preview  h help")
+	right := m.styles.help.Render("n note  N folder  . pin  a archive  A show arch  s scratch  Ctrl+K link  t template  / search  h help")
 	content := joinBar(left, right, innerWidth)
 	return m.styles.statusBar.Width(width).Render(content)
 }
@@ -1410,6 +1690,8 @@ func (m model) renderHelpPanel(width int) string {
 		"",
 		m.styles.item.Render("n               new note (browser)"),
 		m.styles.item.Render("N               new folder (browser)"),
+		m.styles.item.Render("t               new note from template"),
+		m.styles.item.Render("T               save current note as template"),
 		m.styles.item.Render("r               rename selected"),
 		m.styles.item.Render("d               delete selected note/folder"),
 		m.styles.item.Render("p / tab         switch panel"),
@@ -1419,6 +1701,11 @@ func (m model) renderHelpPanel(width int) string {
 		m.styles.item.Render("v               vim on/off"),
 		m.styles.item.Render("L               lock/unlock item"),
 		m.styles.item.Render("Ctrl+L          lock/unlock app"),
+		m.styles.item.Render("s               scratch pad (s to save & close)"),
+		m.styles.item.Render(".               pin/unpin note (browser)"),
+		m.styles.item.Render("a               archive/unarchive note (browser)"),
+		m.styles.item.Render("A               toggle archived visibility"),
+		m.styles.item.Render("Ctrl+K          insert [[link]] to note"),
 		m.styles.item.Render("h / H / Ctrl+H  help"),
 		m.styles.item.Render("q               quit (normal mode)"),
 		"",
@@ -1527,4 +1814,236 @@ func labelForPanel(v panel) string {
 		return "preview"
 	}
 	return "browser"
+}
+
+// --- Pinned & Archived helpers ---
+
+func sortPinnedToTop(nodes []*browserNode, ms *metaStore) {
+	sort.SliceStable(nodes, func(i, j int) bool {
+		ip := ms.IsPinned(nodes[i].path)
+		jp := ms.IsPinned(nodes[j].path)
+		if ip != jp {
+			return ip
+		}
+		if nodes[i].isFolder != nodes[j].isFolder {
+			return nodes[i].isFolder
+		}
+		return strings.ToLower(nodes[i].name) < strings.ToLower(nodes[j].name)
+	})
+	for _, n := range nodes {
+		if n.isFolder {
+			sortPinnedToTop(n.children, ms)
+		}
+	}
+}
+
+func filterArchived(nodes []*browserNode, ms *metaStore) []*browserNode {
+	result := make([]*browserNode, 0, len(nodes))
+	for _, n := range nodes {
+		if !n.isFolder && ms.IsArchived(n.path) {
+			continue
+		}
+		if n.isFolder {
+			n.children = filterArchived(n.children, ms)
+		}
+		result = append(result, n)
+	}
+	return result
+}
+
+// --- Scratch Pad handler ---
+
+func (m model) handleScratchKey(msg tea.KeyMsg) model {
+	switch msg.String() {
+	case "s":
+		m.meta.SaveScratch(m.scratchInput.Value())
+		m.scratchMode = false
+		m.scratchInput.Blur()
+		m.statusMessage = "Scratch saved"
+		return m
+	case "esc":
+		m.scratchMode = false
+		m.scratchInput.Blur()
+		m.statusMessage = "Scratch closed"
+		return m
+	case "enter":
+		m.scratchInput.SetValue(m.scratchInput.Value() + "\n")
+	}
+
+	var cmd tea.Cmd
+	m.scratchInput, cmd = m.scratchInput.Update(msg)
+	_ = cmd
+	return m
+}
+
+// --- Quick Note Linking handler ---
+
+func (m model) handleLinkKey(msg tea.KeyMsg) model {
+	switch msg.Type {
+	case tea.KeyEsc:
+		m.linkMode = false
+		m.linkInput.Blur()
+		m.linkInput.SetValue("")
+		m.linkResults = nil
+		m.statusMessage = "Link cancelled"
+		return m
+	case tea.KeyEnter:
+		if len(m.linkResults) > 0 {
+			name := m.allNotes[m.linkResults[0].Index].name
+			link := "[[" + name + "]]"
+			if m.editor.vimEnabled && m.editor.mode == editorModeNormal {
+				m.editor.mode = editorModeInsert
+			}
+			for _, ch := range link {
+				m.editor.insertRune(ch)
+			}
+			m.saveCurrentNote()
+			m.statusMessage = "Linked: " + name
+		}
+		m.linkMode = false
+		m.linkInput.Blur()
+		m.linkInput.SetValue("")
+		m.linkResults = nil
+		return m
+	case tea.KeyDown:
+		if len(m.linkResults) > 1 {
+			m.linkResults = m.linkResults[1:]
+		}
+		return m
+	}
+
+	var cmd tea.Cmd
+	m.linkInput, cmd = m.linkInput.Update(msg)
+
+	query := m.linkInput.Value()
+	if query != "" {
+		names := make([]string, len(m.allNotes))
+		for i, n := range m.allNotes {
+			names[i] = n.name
+		}
+		m.linkResults = fuzzy.Find(query, names)
+	} else {
+		m.linkResults = nil
+	}
+
+	_ = cmd
+	return m
+}
+
+// --- Template handler ---
+
+func (m model) handleTemplateKey(msg tea.KeyMsg) model {
+	switch msg.Type {
+	case tea.KeyEsc:
+		m.templateMode = false
+		m.templateInput.Blur()
+		m.templateInput.SetValue("")
+		m.templateResults = nil
+		m.statusMessage = "Template cancelled"
+		return m
+	case tea.KeyEnter:
+		templates := m.meta.ListTemplates()
+		query := m.templateInput.Value()
+
+		// If Shift+T (save current note as template)
+		if query == "" && m.selectedPath != "" {
+			node := m.currentNode()
+			if node != nil && !node.isFolder {
+				content := m.editor.content()
+				tName := node.name
+				if tName == "" {
+					tName = "untitled"
+				}
+				m.meta.SetTemplate(tName, content)
+				m.templateMode = false
+				m.templateInput.Blur()
+				m.statusMessage = "Template saved: " + tName
+				return m
+			}
+		}
+
+		// Use a template to create a new note
+		selectedName := ""
+		if len(m.templateResults) > 0 {
+			selectedName = templates[m.templateResults[0].Index]
+		} else if query != "" {
+			for _, t := range templates {
+				if strings.EqualFold(t, query) {
+					selectedName = t
+					break
+				}
+			}
+		}
+		if selectedName != "" {
+			tmpl, ok := m.meta.GetTemplate(selectedName)
+			if ok {
+				path, err := m.storage.createNote(m.currentNode())
+				if err != nil {
+					m.statusMessage = err.Error()
+					m.templateMode = false
+					m.templateInput.Blur()
+					return m
+				}
+				noteName := strings.TrimSuffix(filepath.Base(path), noteExtension)
+				expanded := expandTemplate(tmpl, noteName)
+				if err := m.storage.writeNote(path, expanded); err != nil {
+					m.statusMessage = err.Error()
+				} else {
+					m.statusMessage = "Created from template: " + selectedName
+				}
+				m.templateMode = false
+				m.templateInput.Blur()
+				_ = m.reloadTreeAndSelect(path)
+				return m
+			}
+		}
+		m.statusMessage = "No template selected"
+		return m
+	}
+
+	var cmd tea.Cmd
+	m.templateInput, cmd = m.templateInput.Update(msg)
+
+	query := m.templateInput.Value()
+	templates := m.meta.ListTemplates()
+	if query != "" {
+		m.templateResults = fuzzy.Find(query, templates)
+	} else {
+		m.templateResults = nil
+	}
+
+	_ = cmd
+	return m
+}
+
+// --- Stats computation ---
+
+type noteStats struct {
+	Words       int
+	Chars       int
+	Lines       int
+	ReadingTime string
+}
+
+func computeStats(content string) noteStats {
+	if content == "" {
+		return noteStats{ReadingTime: "0m"}
+	}
+	lines := strings.Count(content, "\n") + 1
+	chars := len([]rune(content))
+	words := len(strings.Fields(content))
+	minutes := words / 200
+	if minutes < 1 {
+		minutes = 1
+	}
+	rt := fmt.Sprintf("%dm", minutes)
+	if minutes >= 60 {
+		rt = fmt.Sprintf("%dh%dm", minutes/60, minutes%60)
+	}
+	return noteStats{
+		Words:       words,
+		Chars:       chars,
+		Lines:       lines,
+		ReadingTime: rt,
+	}
 }
