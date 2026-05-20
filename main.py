@@ -7,12 +7,26 @@ import os
 import sys
 import json
 import subprocess
-import curses
 import shutil
 from pathlib import Path
 
+try:
+    import curses
+except ImportError:
+    # Windows doesn't ship curses — needs windows-curses
+    try:
+        import windows_curses as curses  # type: ignore
+
+        sys.modules["curses"] = curses
+    except ImportError:
+        print("missing dependency: run  pip install windows-curses")
+        sys.exit(1)
+
 # ── paths ────────────────────────────────────────────────────────────────────
-DATA_DIR = Path.home() / "appdata" / "blob"
+if sys.platform == "win32":
+    DATA_DIR = Path.home() / "AppData" / "Local" / "blob"
+else:
+    DATA_DIR = Path.home() / ".local" / "share" / "blob"
 NOTES_DIR = DATA_DIR / "notes"
 CONFIG_FILE = DATA_DIR / "config.json"
 
