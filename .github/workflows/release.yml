@@ -35,7 +35,7 @@ jobs:
             output: blob.exe
 
           # macos amd64
-          - os: macos-13
+          - os: macos-latest
             target: macos-amd64
             cc: clang
             output: blob
