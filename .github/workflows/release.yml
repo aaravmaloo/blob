@@ -31,7 +31,7 @@ jobs:
             cc: gcc
             output: blob.exe
 
-          - os: macos-13
+          - os: macos-latest
             target: macos-amd64
             cc: clang
             output: blob
@@ -62,7 +62,7 @@ jobs:
             -ffunction-sections \
             -fdata-sections \
             -Wl,--gc-sections \
-            blob.c \
+            main.c \
             -o ${{ matrix.output }}
 
       # build windows
@@ -76,7 +76,7 @@ jobs:
             -ffunction-sections \
             -fdata-sections \
             -Wl,--gc-sections \
-            blob.c \
+            main.c \
             -o ${{ matrix.output }}
 
       # rename standalone binary
