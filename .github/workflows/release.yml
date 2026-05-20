@@ -1,0 +1,120 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+
+      matrix:
+        include:
+
+          - os: ubuntu-latest
+            target: linux-amd64
+            cc: gcc
+            output: blob
+
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+            cc: gcc
+            output: blob
+
+          - os: windows-latest
+            target: windows-amd64
+            cc: gcc
+            output: blob.exe
+
+          - os: macos-13
+            target: macos-amd64
+            cc: clang
+            output: blob
+
+          - os: macos-latest
+            target: macos-arm64
+            cc: clang
+            output: blob
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: setup mingw
+        if: runner.os == 'Windows'
+        uses: egor-tensin/setup-mingw@v2
+
+      # build unix
+      - name: build unix
+        if: runner.os != 'Windows'
+        run: |
+          ${{ matrix.cc }} \
+            -Os \
+            -s \
+            -ffunction-sections \
+            -fdata-sections \
+            -Wl,--gc-sections \
+            blob.c \
+            -o ${{ matrix.output }}
+
+      # build windows
+      - name: build windows
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          gcc \
+            -Os \
+            -s \
+            -ffunction-sections \
+            -fdata-sections \
+            -Wl,--gc-sections \
+            blob.c \
+            -o ${{ matrix.output }}
+
+      # rename standalone binary
+      - name: rename binary
+        shell: bash
+        run: |
+          mkdir release
+
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp ${{ matrix.output }} release/blob-${{ matrix.target }}.exe
+          else
+            cp ${{ matrix.output }} release/blob-${{ matrix.target }}
+            chmod +x release/blob-${{ matrix.target }}
+          fi
+
+      # create archives
+      - name: create archives
+        shell: bash
+        run: |
+          mkdir archive
+
+          cp README.md archive/ || true
+          cp LICENSE archive/ || true
+          cp ${{ matrix.output }} archive/
+
+          cd archive
+
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            zip ../blob-${{ matrix.target }}.zip *
+          else
+            tar -czf ../blob-${{ matrix.target }}.tar.gz *
+          fi
+
+      # publish everything
+      - name: publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*
+            *.zip
+            *.tar.gz
