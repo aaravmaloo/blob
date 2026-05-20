@@ -1,358 +1,269 @@
-"""
-blob — a minimal notepad that stays outta your way.
-Data dir: ~/appdata/blob/
-"""
+#!/usr/bin/env python3
+"""blob — minimal notepad."""
 
-import os
-import sys
-import json
-import subprocess
-import shutil
+import os, sys, json, subprocess, shutil
 from pathlib import Path
 
-try:
-    import curses
-except ImportError:
-    # Windows doesn't ship curses — needs windows-curses
-    try:
-        import windows_curses as curses  # type: ignore
-
-        sys.modules["curses"] = curses
-    except ImportError:
-        print("missing dependency: run  pip install windows-curses")
-        sys.exit(1)
-
-# ── paths ────────────────────────────────────────────────────────────────────
+# ── paths ─────────────────────────────────────────────────────────────────────
 if sys.platform == "win32":
     DATA_DIR = Path.home() / "AppData" / "Local" / "blob"
 else:
     DATA_DIR = Path.home() / ".local" / "share" / "blob"
+
 NOTES_DIR = DATA_DIR / "notes"
 CONFIG_FILE = DATA_DIR / "config.json"
 
-# ── default config ────────────────────────────────────────────────────────────
-DEFAULT_CONFIG = {
-    "editor": "vim",
-    "theme": {
-        "title_fg": "cyan",
-        "title_bold": True,
-        "item_fg": "white",
-        "selected_fg": "black",
-        "selected_bg": "cyan",
-        "hint_fg": "bright_black",
-        "border_fg": "cyan",
-    },
+if sys.platform == "win32":
+    DEFAULT_EDITOR = "nvim"
+else:
+    DEFAULT_EDITOR = "vim"
+
+DEFAULT_CONFIG = {"editor": DEFAULT_EDITOR, "theme": {"accent": "cyan"}}
+
+# ── ANSI ──────────────────────────────────────────────────────────────────────
+# enable VT on windows
+if sys.platform == "win32":
+    import ctypes
+
+    kernel32 = ctypes.windll.kernel32
+    kernel32.SetConsoleMode(kernel32.GetStdHandle(-11), 7)
+
+ANSI = {
+    "reset": "\033[0m",
+    "bold": "\033[1m",
+    "dim": "\033[2m",
+    "cyan": "\033[96m",
+    "green": "\033[92m",
+    "yellow": "\033[93m",
+    "magenta": "\033[95m",
+    "blue": "\033[94m",
+    "white": "\033[97m",
+    "red": "\033[91m",
+    "black": "\033[30m",
+    "bg_cyan": "\033[46m",
+    "bg_green": "\033[42m",
+    "bg_yellow": "\033[43m",
+    "bg_magenta": "\033[45m",
+    "bg_blue": "\033[44m",
+    "bg_white": "\033[47m",
+    "hide_cursor": "\033[?25l",
+    "show_cursor": "\033[?25h",
 }
 
-# curses color name → curses constant
-COLOR_MAP = {
-    "black": curses.COLOR_BLACK,
-    "red": curses.COLOR_RED,
-    "green": curses.COLOR_GREEN,
-    "yellow": curses.COLOR_YELLOW,
-    "blue": curses.COLOR_BLUE,
-    "magenta": curses.COLOR_MAGENTA,
-    "cyan": curses.COLOR_CYAN,
-    "white": curses.COLOR_WHITE,
-    "bright_black": 8,  # most terminals support 256 colors
+BG_MAP = {
+    "cyan": "bg_cyan",
+    "green": "bg_green",
+    "yellow": "bg_yellow",
+    "magenta": "bg_magenta",
+    "blue": "bg_blue",
+    "white": "bg_white",
 }
 
 
-# ── config helpers ────────────────────────────────────────────────────────────
-def load_config() -> dict:
+def a(*keys):
+    return "".join(ANSI.get(k, "") for k in keys)
+
+
+def clear():
+    os.system("cls" if sys.platform == "win32" else "clear")
+
+
+# ── raw input ─────────────────────────────────────────────────────────────────
+if sys.platform == "win32":
+    import msvcrt
+
+    def getch():
+        ch = msvcrt.getwch()
+        if ch in ("\x00", "\xe0"):
+            return {"H": "UP", "P": "DOWN", "K": "LEFT", "M": "RIGHT"}.get(
+                msvcrt.getwch(), ""
+            )
+        if ch == "\r":
+            return "ENTER"
+        if ch == "\x03":
+            raise KeyboardInterrupt
+        return ch
+else:
+    import tty, termios
+
+    def getch():
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            ch = sys.stdin.read(1)
+            if ch == "\x1b":
+                ch2 = sys.stdin.read(1)
+                ch3 = sys.stdin.read(1)
+                return {"A": "UP", "B": "DOWN", "C": "RIGHT", "D": "LEFT"}.get(ch3, "")
+            if ch in ("\r", "\n"):
+                return "ENTER"
+            if ch == "\x03":
+                raise KeyboardInterrupt
+            return ch
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+# ── config ────────────────────────────────────────────────────────────────────
+def load_config():
     if CONFIG_FILE.exists():
         try:
-            with open(CONFIG_FILE) as f:
-                cfg = json.load(f)
-            # merge missing keys from default
+            cfg = json.loads(CONFIG_FILE.read_text())
             for k, v in DEFAULT_CONFIG.items():
                 if k not in cfg:
                     cfg[k] = v
                 elif isinstance(v, dict):
                     for kk, vv in v.items():
-                        if kk not in cfg[k]:
-                            cfg[k][kk] = vv
+                        cfg[k].setdefault(kk, vv)
             return cfg
         except Exception:
             pass
     return dict(DEFAULT_CONFIG)
 
 
-def save_config(cfg: dict):
+def save_config(cfg):
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
 
 
-# ── note helpers ──────────────────────────────────────────────────────────────
+# ── notes ─────────────────────────────────────────────────────────────────────
 def ensure_dirs():
     NOTES_DIR.mkdir(parents=True, exist_ok=True)
     if not CONFIG_FILE.exists():
         save_config(DEFAULT_CONFIG)
 
 
-def list_notes() -> list[Path]:
+def list_notes():
     if not NOTES_DIR.exists():
         return []
-    notes = sorted(
-        NOTES_DIR.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True
-    )
-    return notes
+    return sorted(NOTES_DIR.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
 
 
-def note_path(name: str) -> Path:
-    if not name.endswith(".md"):
-        name += ".md"
-    return NOTES_DIR / name
+def sanitize(name):
+    name = name.strip().replace("/", "-").replace("\\", "-")
+    return name if name.endswith(".md") else name + ".md"
 
 
-def open_note(path: Path, editor: str):
-    """Open note in editor, suspending curses."""
-    curses.endwin()
+# ── editor ────────────────────────────────────────────────────────────────────
+def open_note(path, editor):
+    sys.stdout.write(a("show_cursor"))
+    sys.stdout.flush()
+
     if not shutil.which(editor):
-        print(f"\n  blob: editor '{editor}' not found.")
-        print(f"  Install it or set a different editor in {CONFIG_FILE}\n")
-        input("  press enter to continue...")
+        clear()
+        print(f"\n  {a('red')}blob: '{editor}' not found in PATH.{a('reset')}")
+        print(f"  Edit your config: {CONFIG_FILE}")
+        print(f'  Set "editor" to nvim, notepad, code, etc.\n')
+        input("  press enter...")
         return
-    subprocess.call([editor, str(path)])
+
+    clear()
+    if sys.platform == "win32":
+        # wait=True so we get the terminal back after editor closes
+        subprocess.run([editor, str(path)])
+    else:
+        subprocess.call([editor, str(path)])
 
 
-def delete_note(path: Path):
-    path.unlink(missing_ok=True)
+# ── render ────────────────────────────────────────────────────────────────────
+def render(notes, sel, cfg, status=""):
+    accent = cfg["theme"].get("accent", "cyan")
+    bg = BG_MAP.get(accent, "bg_cyan")
 
-
-# ── curses theme setup ────────────────────────────────────────────────────────
-PAIR_TITLE = 1
-PAIR_ITEM = 2
-PAIR_SELECTED = 3
-PAIR_HINT = 4
-PAIR_BORDER = 5
-PAIR_DANGER = 6
-
-
-def init_colors(theme: dict):
-    curses.start_color()
-    curses.use_default_colors()
-
-    def c(name):
-        return COLOR_MAP.get(name, curses.COLOR_WHITE)
-
-    curses.init_pair(PAIR_TITLE, c(theme["title_fg"]), -1)
-    curses.init_pair(PAIR_ITEM, c(theme["item_fg"]), -1)
-    curses.init_pair(PAIR_SELECTED, c(theme["selected_fg"]), c(theme["selected_bg"]))
-    curses.init_pair(PAIR_HINT, c(theme["hint_fg"]), -1)
-    curses.init_pair(PAIR_BORDER, c(theme["border_fg"]), -1)
-    curses.init_pair(PAIR_DANGER, curses.COLOR_RED, -1)
-
-
-# ── draw helpers ──────────────────────────────────────────────────────────────
-def safe_addstr(win, y, x, text, attr=0):
-    h, w = win.getmaxyx()
-    if y < 0 or y >= h:
-        return
-    max_len = w - x - 1
-    if max_len <= 0:
-        return
-    try:
-        win.addstr(y, x, text[:max_len], attr)
-    except curses.error:
-        pass
-
-
-def draw_border(win, theme):
-    attr = curses.color_pair(PAIR_BORDER)
-    h, w = win.getmaxyx()
-    try:
-        win.border()
-    except curses.error:
-        pass
-
-
-def draw_ui(win, notes: list[Path], sel: int, offset: int, cfg: dict, status: str = ""):
-    win.erase()
-    h, w = win.getmaxyx()
-    theme = cfg["theme"]
-
-    draw_border(win, theme)
-
-    # title
-    title = " blob "
-    title_attr = curses.color_pair(PAIR_TITLE)
-    if theme.get("title_bold"):
-        title_attr |= curses.A_BOLD
-    safe_addstr(win, 0, max(2, (w - len(title)) // 2), title, title_attr)
-
-    # editor hint (top right)
-    editor_hint = f" {cfg['editor']} "
-    safe_addstr(
-        win, 0, w - len(editor_hint) - 2, editor_hint, curses.color_pair(PAIR_HINT)
+    clear()
+    print(
+        f"  {a('bold', accent)}blob{a('reset')}  {a('dim')}{cfg['editor']}{a('reset')}\n"
     )
-
-    list_top = 2
-    list_bottom = h - 3
-    visible = list_bottom - list_top
 
     if not notes:
-        msg = "no notes yet — press n to create one"
-        safe_addstr(
-            win, h // 2, max(1, (w - len(msg)) // 2), msg, curses.color_pair(PAIR_HINT)
-        )
+        print(f"  {a('dim')}no notes — press n to create one{a('reset')}")
     else:
-        for i, note in enumerate(notes[offset : offset + visible]):
-            idx = offset + i
-            row = list_top + i
+        for i, note in enumerate(notes):
             name = note.stem
-            line = f"  {name}"
-
-            if idx == sel:
-                attr = curses.color_pair(PAIR_SELECTED) | curses.A_BOLD
-                safe_addstr(
-                    win, row, 1, " " * (w - 2), curses.color_pair(PAIR_SELECTED)
-                )
-                safe_addstr(win, row, 1, line, attr)
+            if i == sel:
+                print(f"  {a('bold', bg, 'black')} {name} {a('reset')}")
             else:
-                safe_addstr(win, row, 1, line, curses.color_pair(PAIR_ITEM))
+                print(f"  {a('dim')}·{a('reset')} {name}")
 
-    # bottom hints
-    hints = " n:new  enter:open  d:delete  q:quit "
-    safe_addstr(
-        win, h - 2, max(1, (w - len(hints)) // 2), hints, curses.color_pair(PAIR_HINT)
-    )
+    print(f"\n  {a('dim')}↑↓ navigate  enter:open  n:new  d:delete  q:quit{a('reset')}")
 
-    # status bar
     if status:
-        safe_addstr(
-            win,
-            h - 1,
-            2,
-            status[: w - 4],
-            curses.color_pair(PAIR_DANGER) | curses.A_BOLD,
-        )
-
-    win.refresh()
+        print(f"\n  {a('red')}{status}{a('reset')}")
 
 
-# ── input prompt ─────────────────────────────────────────────────────────────
-def prompt_input(win, prompt: str) -> str:
-    h, w = win.getmaxyx()
-    row = h - 2
-    curses.echo()
-    curses.curs_set(1)
-    win.move(row, 1)
-    win.clrtoeol()
-    safe_addstr(win, row, 1, prompt, curses.color_pair(PAIR_TITLE) | curses.A_BOLD)
-    win.refresh()
-    try:
-        val = (
-            win.getstr(row, 1 + len(prompt), w - len(prompt) - 4)
-            .decode("utf-8")
-            .strip()
-        )
-    except Exception:
-        val = ""
-    curses.noecho()
-    curses.curs_set(0)
-    return val
-
-
-# ── confirm prompt ────────────────────────────────────────────────────────────
-def confirm(win, msg: str) -> bool:
-    h, w = win.getmaxyx()
-    row = h - 2
-    win.move(row, 1)
-    win.clrtoeol()
-    full = f"{msg} [y/N] "
-    safe_addstr(win, row, 1, full, curses.color_pair(PAIR_DANGER) | curses.A_BOLD)
-    win.refresh()
-    ch = win.getch()
-    return ch in (ord("y"), ord("Y"))
-
-
-# ── main TUI loop ─────────────────────────────────────────────────────────────
-def main(win):
+# ── main ──────────────────────────────────────────────────────────────────────
+def main():
     ensure_dirs()
     cfg = load_config()
-    theme = cfg["theme"]
-
-    curses.curs_set(0)
-    init_colors(theme)
-    win.keypad(True)
-
     notes = list_notes()
     sel = 0
-    offset = 0
     status = ""
 
-    while True:
-        h, _ = win.getmaxyx()
-        visible = max(1, h - 5)
+    sys.stdout.write(a("hide_cursor"))
+    sys.stdout.flush()
 
-        # clamp sel
-        if notes:
-            sel = max(0, min(sel, len(notes) - 1))
-            if sel < offset:
-                offset = sel
-            elif sel >= offset + visible:
-                offset = sel - visible + 1
-        else:
-            sel = offset = 0
+    try:
+        while True:
+            sel = max(0, min(sel, len(notes) - 1)) if notes else 0
+            render(notes, sel, cfg, status)
+            status = ""
 
-        draw_ui(win, notes, sel, offset, cfg, status)
-        status = ""
+            key = getch()
 
-        key = win.getch()
+            if key in ("q", "Q"):
+                break
 
-        if key in (ord("q"), ord("Q")):
-            break
-
-        elif key == curses.KEY_UP:
-            if notes:
+            elif key == "UP":
                 sel = max(0, sel - 1)
 
-        elif key == curses.KEY_DOWN:
-            if notes:
-                sel = min(len(notes) - 1, sel + 1)
+            elif key == "DOWN":
+                sel = min(len(notes) - 1, sel + 1) if notes else 0
 
-        elif key in (curses.KEY_ENTER, 10, 13):
-            if notes:
-                open_note(notes[sel], cfg["editor"])
-                # re-init after editor exits
-                curses.curs_set(0)
-                init_colors(cfg["theme"])
-                win.keypad(True)
-                notes = list_notes()
-
-        elif key in (ord("n"), ord("N")):
-            name = prompt_input(win, "note name: ")
-            if name:
-                # sanitize — no slashes
-                name = name.replace("/", "-").replace("\\", "-")
-                path = note_path(name)
-                if path.exists():
-                    status = f"note '{name}' already exists"
-                else:
-                    path.touch()
-                    open_note(path, cfg["editor"])
-                    curses.curs_set(0)
-                    init_colors(cfg["theme"])
-                    win.keypad(True)
-                notes = list_notes()
-                # put cursor on the new note
-                try:
-                    sel = next(i for i, n in enumerate(notes) if n.stem == name)
-                except StopIteration:
-                    sel = 0
-
-        elif key in (ord("d"), ord("D")):
-            if notes:
-                name = notes[sel].stem
-                if confirm(win, f"delete '{name}'?"):
-                    delete_note(notes[sel])
+            elif key == "ENTER":
+                if notes:
+                    open_note(notes[sel], cfg["editor"])
                     notes = list_notes()
-                    sel = max(0, sel - 1)
 
+            elif key in ("n", "N", "+"):
+                render(notes, sel, cfg)
+                sys.stdout.write(a("show_cursor"))
+                sys.stdout.flush()
+                name = input("  new note name: ").strip()
+                sys.stdout.write(a("hide_cursor"))
+                sys.stdout.flush()
+                if name:
+                    path = NOTES_DIR / sanitize(name)
+                    if path.exists():
+                        status = f"'{name}' already exists"
+                    else:
+                        path.touch()
+                        open_note(path, cfg["editor"])
+                        notes = list_notes()
+                        try:
+                            sel = next(i for i, n in enumerate(notes) if n.stem == name)
+                        except StopIteration:
+                            sel = 0
 
-# ── entry point ───────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    try:
-        curses.wrapper(main)
+            elif key in ("d", "D"):
+                if notes:
+                    name = notes[sel].stem
+                    render(notes, sel, cfg)
+                    sys.stdout.write(a("show_cursor"))
+                    sys.stdout.flush()
+                    confirm = input(f"  delete '{name}'? [y/N]: ").strip().lower()
+                    sys.stdout.write(a("hide_cursor"))
+                    sys.stdout.flush()
+                    if confirm == "y":
+                        notes[sel].unlink(missing_ok=True)
+                        notes = list_notes()
+                        sel = max(0, sel - 1)
+
     except KeyboardInterrupt:
         pass
+    finally:
+        sys.stdout.write(a("show_cursor", "reset") + "\n")
+        sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    main()
