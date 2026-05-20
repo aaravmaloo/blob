@@ -172,10 +172,14 @@ jobs:
 
           done
 
-      # publish github release
+            # publish github release
       - name: publish release
         uses: softprops/action-gh-release@v2
         with:
+          fail_on_unmatched_files: false
+          draft: false
+          prerelease: false
+          generate_release_notes: true
           files: |
             release/*
             *.zip
