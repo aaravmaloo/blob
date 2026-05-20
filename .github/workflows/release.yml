@@ -53,12 +53,6 @@ jobs:
       - name: checkout
         uses: actions/checkout@v4
 
-      # windows gcc
-      - name: setup mingw
-        if: runner.os == 'Windows'
-        uses: egor-tensin/setup-mingw@v2
-
-      # build linux + macos
       - name: build unix
         if: runner.os != 'Windows'
         shell: bash
