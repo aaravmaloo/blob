@@ -16,26 +16,31 @@ jobs:
       matrix:
         include:
 
+          # linux amd64
           - os: ubuntu-latest
             target: linux-amd64
             cc: gcc
             output: blob
 
+          # linux arm64
           - os: ubuntu-24.04-arm
             target: linux-arm64
             cc: gcc
             output: blob
 
+          # windows amd64
           - os: windows-latest
             target: windows-amd64
             cc: gcc
             output: blob.exe
 
-          - os: macos-latest
+          # macos amd64
+          - os: macos-13
             target: macos-amd64
             cc: clang
             output: blob
 
+          # macos arm64
           - os: macos-latest
             target: macos-arm64
             cc: clang
@@ -48,28 +53,50 @@ jobs:
       - name: checkout
         uses: actions/checkout@v4
 
+      # windows compiler
       - name: setup mingw
         if: runner.os == 'Windows'
         uses: egor-tensin/setup-mingw@v2
 
-      # build unix
+      # build linux + macos
       - name: build unix
         if: runner.os != 'Windows'
+        shell: bash
         run: |
-          ${{ matrix.cc }} \
-            -Os \
-            -s \
-            -ffunction-sections \
-            -fdata-sections \
-            -Wl,--gc-sections \
-            main.c \
-            -o ${{ matrix.output }}
+
+          # macos
+          if [[ "${{ runner.os }}" == "macOS" ]]; then
+
+            ${{ matrix.cc }} \
+              -Os \
+              -ffunction-sections \
+              -fdata-sections \
+              -dead_strip \
+              main.c \
+              -o ${{ matrix.output }}
+
+            strip ${{ matrix.output }}
+
+          # linux
+          else
+
+            ${{ matrix.cc }} \
+              -Os \
+              -s \
+              -ffunction-sections \
+              -fdata-sections \
+              -Wl,--gc-sections \
+              main.c \
+              -o ${{ matrix.output }}
+
+          fi
 
       # build windows
       - name: build windows
         if: runner.os == 'Windows'
         shell: bash
         run: |
+
           gcc \
             -Os \
             -s \
@@ -79,24 +106,34 @@ jobs:
             main.c \
             -o ${{ matrix.output }}
 
-      # rename standalone binary
+      # standalone binaries
       - name: rename binary
         shell: bash
         run: |
-          mkdir release
+
+          mkdir -p release
 
           if [[ "${{ runner.os }}" == "Windows" ]]; then
-            cp ${{ matrix.output }} release/blob-${{ matrix.target }}.exe
+
+            cp ${{ matrix.output }} \
+              release/blob-${{ matrix.target }}.exe
+
           else
-            cp ${{ matrix.output }} release/blob-${{ matrix.target }}
-            chmod +x release/blob-${{ matrix.target }}
+
+            cp ${{ matrix.output }} \
+              release/blob-${{ matrix.target }}
+
+            chmod +x \
+              release/blob-${{ matrix.target }}
+
           fi
 
-      # create archives
+      # archives
       - name: create archives
         shell: bash
         run: |
-          mkdir archive
+
+          mkdir -p archive
 
           cp README.md archive/ || true
           cp LICENSE archive/ || true
@@ -105,12 +142,27 @@ jobs:
           cd archive
 
           if [[ "${{ runner.os }}" == "Windows" ]]; then
+
             zip ../blob-${{ matrix.target }}.zip *
+
           else
+
             tar -czf ../blob-${{ matrix.target }}.tar.gz *
+
           fi
 
-      # publish everything
+      # checksums
+      - name: generate checksums
+        shell: bash
+        run: |
+
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum release/* *.zip *.tar.gz > SHA256SUMS
+          else
+            shasum -a 256 release/* *.zip *.tar.gz > SHA256SUMS
+          fi
+
+      # github release
       - name: publish release
         uses: softprops/action-gh-release@v2
         with:
@@ -118,3 +170,4 @@ jobs:
             release/*
             *.zip
             *.tar.gz
+            SHA256SUMS
