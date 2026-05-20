@@ -1,4 +1,0 @@
-# blob requirements
-# on Linux/macOS: curses is built into Python's stdlib — nothing to install
-# on Windows: install this
-windows-curses; sys_platform == "win32"
