@@ -10,6 +10,7 @@ permissions:
 
 jobs:
   build:
+
     strategy:
       fail-fast: false
 
@@ -35,7 +36,7 @@ jobs:
             output: blob.exe
 
           # macos amd64
-          - os: macos-latest
+          - os: macos-13
             target: macos-amd64
             cc: clang
             output: blob
@@ -50,9 +51,11 @@ jobs:
 
     steps:
 
+      # checkout
       - name: checkout
         uses: actions/checkout@v4
 
+      # build linux + macos
       - name: build unix
         if: runner.os != 'Windows'
         shell: bash
@@ -100,7 +103,7 @@ jobs:
             main.c \
             -o ${{ matrix.output }}
 
-      # rename standalone binaries
+      # standalone binaries
       - name: rename binary
         shell: bash
         run: |
@@ -109,16 +112,16 @@ jobs:
 
           if [[ "${{ runner.os }}" == "Windows" ]]; then
 
-            cp ${{ matrix.output }} \
-              release/blob-${{ matrix.target }}.exe
+            cp "${{ matrix.output }}" \
+              "release/blob-${{ matrix.target }}.exe"
 
           else
 
-            cp ${{ matrix.output }} \
-              release/blob-${{ matrix.target }}
+            cp "${{ matrix.output }}" \
+              "release/blob-${{ matrix.target }}"
 
             chmod +x \
-              release/blob-${{ matrix.target }}
+              "release/blob-${{ matrix.target }}"
 
           fi
 
@@ -129,19 +132,30 @@ jobs:
 
           mkdir -p archive
 
-          cp README.md archive/ || true
-          cp LICENSE archive/ || true
-          cp ${{ matrix.output }} archive/
+          # optional files
+          if [[ -f README.md ]]; then
+            cp README.md archive/
+          fi
 
-          cd archive
+          if [[ -f LICENSE ]]; then
+            cp LICENSE archive/
+          fi
 
+          cp "${{ matrix.output }}" archive/
+
+          # windows
           if [[ "${{ runner.os }}" == "Windows" ]]; then
 
-            zip ../blob-${{ matrix.target }}.zip *
+            powershell Compress-Archive \
+              -Path archive/* \
+              -DestinationPath blob-${{ matrix.target }}.zip
 
+          # unix
           else
 
-            tar -czf ../blob-${{ matrix.target }}.tar.gz *
+            tar -czf \
+              blob-${{ matrix.target }}.tar.gz \
+              archive/*
 
           fi
 
@@ -157,16 +171,20 @@ jobs:
             if [[ -f "$file" ]]; then
 
               if command -v sha256sum >/dev/null 2>&1; then
+
                 sha256sum "$file" >> SHA256SUMS
+
               else
+
                 shasum -a 256 "$file" >> SHA256SUMS
+
               fi
 
             fi
 
           done
 
-            # publish github release
+      # publish github release
       - name: publish release
         uses: softprops/action-gh-release@v2
         with:
