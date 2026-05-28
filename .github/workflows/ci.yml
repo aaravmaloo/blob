@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            cc: gcc
+            output: blob
+          - os: macos-13
+            cc: clang
+            output: blob
+          - os: macos-14
+            cc: clang
+            output: blob
+          - os: windows-latest
+            cc: gcc
+            output: blob.exe
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: build
+        shell: bash
+        run: |
+          ${{ matrix.cc }} \
+            -std=c11 \
+            -Wall \
+            -Wextra \
+            -Werror \
+            -pedantic \
+            main.c \
+            -o ${{ matrix.output }}
