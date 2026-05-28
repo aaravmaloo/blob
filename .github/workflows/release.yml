@@ -62,7 +62,7 @@ jobs:
               -Os \
               -ffunction-sections \
               -fdata-sections \
-              -dead_strip \
+              -Wl,-dead_strip \
               main.c \
               -o ${{ matrix.output }}
 
