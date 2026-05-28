@@ -1,12 +1,13 @@
 <h1 align="center">blob: minimal note manager</h1>
 
 
-`blob` is a minimalistic and efficient note manager that stays out of your way. It is programmed in C and is supposed to have the minimal binary size and the most minimalistic interface possible.
+`blob` is a minimalistic and efficient inline terminal note manager that stays out of your way. It is programmed in C and keeps the interface small, fast, and terminal-native.
 
 ## Features
-- blob features a easy to use UI inside the terminal to manage all your notes.
-- deleting notes
-- adding notes
+- inline interactive note selector
+- markdown note creation
+- live note search
+- note deletion
 - customizability
 
 ## Customizing blob
@@ -23,9 +24,27 @@ change dir:
 
 `cd blob`
 
-compile with compression flags:
+compile:
 
-`gcc -Os -s -ffunction-sections -fdata-sections "-Wl,--gc-sections" --static main.c -o blob.exe`
+Linux/macOS:
+```sh
+cc -std=c11 -Wall -Wextra main.c -o blob
+```
+
+Windows:
+```sh
+gcc -std=c11 -Wall -Wextra main.c -o blob.exe
+```
+
+Optimized Linux/Windows release builds can add:
+```sh
+-Os -s -ffunction-sections -fdata-sections -Wl,--gc-sections
+```
+
+Optimized macOS release builds can add:
+```sh
+-Os -ffunction-sections -fdata-sections -Wl,-dead_strip
+```
 
 ## Keybindings
 
@@ -35,6 +54,8 @@ compile with compression flags:
 | `Enter` | Open note |
 | `n` | Create note |
 | `d` | Delete note |
+| `/` | Search notes |
+| `Esc` | Clear search |
 | `q` | Quit |
 
 ## Storage
@@ -46,9 +67,14 @@ Linux:
 ~/.local/share/blob/notes
 ```
 
+macOS:
+```text
+~/Library/Application Support/blob/notes
+```
+
 Windows:
 ```text
-%USERPROFILE%\AppData\Local\blob\notes
+%LOCALAPPDATA%\blob\notes
 ```
 
 ## Philosophy
@@ -59,3 +85,4 @@ blob is designed to be:
 - fast
 - dependency-free
 - simple enough to understand in one source file
+- an inline selector, not a fullscreen TUI
