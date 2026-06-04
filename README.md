@@ -58,8 +58,15 @@ make release
 | `n` | Create note |
 | `d` | Delete note |
 | `/` | Search notes |
+| `p` | Open plugins manager |
 | `Esc` | Clear search |
 | `q` | Quit |
+
+## Plugins
+
+blob supports optional, compiled plugins to extend its features (like encryption or sync) without bloating the core. Press `p` inside the interface to manage plugins. For every step/access blob does, it requires your permission for maximum safety.
+
+If you are a developer and want to create your own plugin, see [PLUGIN_DEVELOPMENT.md](file:///C:/Users/Aarav%20Maloo/Desktop/blob/PLUGIN_DEVELOPMENT.md).
 
 ## Storage
 
