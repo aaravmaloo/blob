@@ -1,6 +1,11 @@
 <h1 align="center">blob: minimal note manager</h1>
 
 
+![build](https://img.shields.io/github/actions/workflow/status/aaravmaloo/blob/ci.yml?label=build&style=flat-square)
+![release](https://img.shields.io/github/v/release/aaravmaloo/blob?style=flat-square)
+![license](https://img.shields.io/badge/license-GPL--2.0-green?style=flat-square)
+![language](https://img.shields.io/badge/language-C-blue?style=flat-square)
+
 `blob` is a minimalistic and efficient inline terminal note manager that stays out of your way. It is programmed in C and keeps the interface small, fast, and terminal-native.
 
 ## Features
