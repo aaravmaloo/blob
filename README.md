@@ -26,25 +26,17 @@ change dir:
 
 compile:
 
-Linux/macOS:
 ```sh
-cc -std=c11 -Wall -Wextra main.c -o blob
+make
 ```
 
-Windows:
+Or for an optimized release build:
+
 ```sh
-gcc -std=c11 -Wall -Wextra main.c -o blob.exe
+make release
 ```
 
-Optimized Linux/Windows release builds can add:
-```sh
--Os -s -ffunction-sections -fdata-sections -Wl,--gc-sections
-```
-
-Optimized macOS release builds can add:
-```sh
--Os -ffunction-sections -fdata-sections -Wl,-dead_strip
-```
+*Note: On Windows, you may need to use `mingw32-make` instead of `make` depending on your environment.*
 
 ## Keybindings
 
