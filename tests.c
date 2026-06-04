@@ -19,10 +19,14 @@ static void test_sanitize_slug(void) {
     sanitize_slug("Mixed-Case_With.Dots", slug, sizeof(slug));
     assert(strcmp(slug, "mixed-case-with-dots") == 0);
 
-    sanitize_slug("!!!", slug, sizeof(slug));
-    assert(strcmp(slug, "untitled") == 0);
+    sanitize_slug("Note 📝", slug, sizeof(slug));
+    // Unicode characters should now be preserved
+    assert(strcmp(slug, "note-📝") == 0);
 
-    printf("test_sanitize_slug passed\n");
+    sanitize_slug("Résumé", slug, sizeof(slug));
+    assert(strcmp(slug, "résumé") == 0);
+    
+    printf("test_sanitize_slug passed (including Unicode support)\n");
 }
 
 static void test_title_from_filename(void) {

@@ -461,11 +461,11 @@ static void sanitize_slug(const char *title, char *slug, size_t slug_size) {
     for (size_t i = 0; title[i] && out + 1 < slug_size; i++) {
         unsigned char ch = (unsigned char)title[i];
 
-        if (isalnum(ch)) {
+        if ((ch <= 127 && isalnum(ch)) || ch >= 128) {
             if (pending_dash && out > 0 && out + 1 < slug_size) {
                 slug[out++] = '-';
             }
-            slug[out++] = (char)tolower(ch);
+            slug[out++] = (ch <= 127) ? (char)tolower(ch) : (char)ch;
             pending_dash = false;
         } else if (ch == '.' && out > 0) {
             pending_dash = true;
