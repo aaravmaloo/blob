@@ -201,9 +201,11 @@ static void enable_raw_mode(void) {
     raw_enabled = true;
 }
 
+#ifndef BLOB_TEST
 static void restore_terminal_at_exit(void) {
     disable_raw_mode();
 }
+#endif
 
 static KeyEvent read_key(void) {
     KeyEvent key = {KEY_NONE, 0};
@@ -313,6 +315,7 @@ static bool ensure_dir(const char *path) {
     return mkdir(path, 0755) == 0 || errno == EEXIST;
 }
 
+#ifndef BLOB_TEST
 static void init_paths(AppConfig *cfg) {
 #ifdef _WIN32
     const char *local_app_data = getenv("LOCALAPPDATA");
@@ -347,6 +350,7 @@ static void init_paths(AppConfig *cfg) {
     ensure_dir(cfg->data_dir);
     ensure_dir(cfg->notes_dir);
 }
+#endif
 
 #ifndef _WIN32
 static bool has_md_extension(const char *name) {
@@ -631,6 +635,7 @@ static void render_line(AppState *state, const char *text) {
     state->rendered_lines++;
 }
 
+#ifndef BLOB_TEST
 static void render_ui(AppState *state) {
     normalize_selection(state);
     clear_owned_region(state);
@@ -694,6 +699,7 @@ static void render_ui(AppState *state) {
 
     fflush(stdout);
 }
+#endif
 
 static bool prompt_text(AppState *state, const char *label, char *buffer, size_t buffer_size) {
     clear_owned_region(state);
@@ -944,6 +950,7 @@ static void handle_search_key(AppState *state, KeyEvent key) {
     }
 }
 
+#ifndef BLOB_TEST
 static void handle_key(AppState *state, const AppConfig *cfg, KeyEvent key) {
     if (key.type == KEY_UP) {
         move_selection(state, -1);
@@ -990,7 +997,9 @@ static void handle_key(AppState *state, const AppConfig *cfg, KeyEvent key) {
         break;
     }
 }
+#endif
 
+#ifndef BLOB_TEST
 static void ui_loop(AppState *state, const AppConfig *cfg) {
     enable_raw_mode();
 
@@ -1002,7 +1011,9 @@ static void ui_loop(AppState *state, const AppConfig *cfg) {
 
     clear_owned_region(state);
 }
+#endif
 
+#ifndef BLOB_TEST
 int main(void) {
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
@@ -1028,3 +1039,4 @@ int main(void) {
     note_list_free(&state.notes);
     return 0;
 }
+#endif
