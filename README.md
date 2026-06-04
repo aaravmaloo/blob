@@ -7,6 +7,11 @@
   <img src="https://img.shields.io/badge/language-C-blue?style=flat-square" />
 </p>
 
+<p align="center">
+  <img src="assets/demo.gif" alt="Demo" width="700">
+</p>
+
+
 `blob` is a minimalistic and efficient inline terminal note manager that stays out of your way. It is programmed in C and keeps the interface small, fast, and terminal-native.
 
 ## Features
