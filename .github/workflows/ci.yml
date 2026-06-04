@@ -15,10 +15,10 @@ jobs:
           - os: ubuntu-latest
             cc: gcc
             make: make
-          - os: macos-13
+          - os: macos-latest
             cc: clang
             make: make
-          - os: macos-14
+          - os: macos-latest
             cc: clang
             make: make
           - os: windows-latest
