@@ -68,9 +68,20 @@
 #define ANSI_SHOW_CURSOR "\x1b[?25h"
 #define ANSI_CLEAR_LINE "\x1b[2K"
 
+void enter_alt_screen(void) {
+    printf("\033[?1049h\033[H");
+    fflush(stdout);
+}
+
+void exit_alt_screen(void) {
+    printf("\033[?1049l");
+    fflush(stdout);
+}
+
 typedef struct {
     char data_dir[PATH_MAX];
     char notes_dir[PATH_MAX];
+    char addons_dir[PATH_MAX];
     char editor[INPUT_MAX];
 } AppConfig;
 
@@ -106,7 +117,8 @@ typedef enum {
     KEY_UP,
     KEY_DOWN,
     KEY_LEFT,
-    KEY_RIGHT
+    KEY_RIGHT,
+    KEY_CTRL_P
 } KeyType;
 
 typedef struct {
@@ -225,6 +237,10 @@ static KeyEvent read_key(void) {
         key.type = KEY_BACKSPACE;
         return key;
     }
+    if (c == 16) {
+        key.type = KEY_CTRL_P;
+        return key;
+    }
     if (c == 0 || c == 224) {
         int ext = _getch();
         if (ext == 72) key.type = KEY_UP;
@@ -249,6 +265,10 @@ static KeyEvent read_key(void) {
     }
     if (c == 127 || c == '\b') {
         key.type = KEY_BACKSPACE;
+        return key;
+    }
+    if (c == 16) {
+        key.type = KEY_CTRL_P;
         return key;
     }
     if (c == '\x1b') {
@@ -346,9 +366,11 @@ static void init_paths(AppConfig *cfg) {
     snprintf(cfg->editor, sizeof(cfg->editor), "%s",
              editor && *editor ? editor : fallback_editor);
     snprintf(cfg->notes_dir, sizeof(cfg->notes_dir), "%s" PATH_SEP "notes", cfg->data_dir);
+    snprintf(cfg->addons_dir, sizeof(cfg->addons_dir), "%s" PATH_SEP "addons", cfg->data_dir);
 
     ensure_dir(cfg->data_dir);
     ensure_dir(cfg->notes_dir);
+    ensure_dir(cfg->addons_dir);
 }
 #endif
 
@@ -686,6 +708,7 @@ static void render_ui(AppState *state) {
         render_line(state, ANSI_DIM "[n] new" ANSI_RESET);
         render_line(state, ANSI_DIM "[d] delete" ANSI_RESET);
         render_line(state, ANSI_DIM "[/] search" ANSI_RESET);
+        render_line(state, ANSI_DIM "[p] plugins" ANSI_RESET);
         render_line(state, ANSI_DIM "[q] quit" ANSI_RESET);
     }
 
@@ -909,21 +932,7 @@ static void delete_note_flow(AppState *state, const AppConfig *cfg) {
     normalize_selection(state);
 }
 
-static void open_selected_note(AppState *state, const AppConfig *cfg) {
-    if (state->notes.count == 0 || !selected_is_visible(state)) {
-        return;
-    }
 
-    char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s", state->notes.items[state->selected].path);
-
-    if (!open_path_in_editor(state, cfg, path)) {
-        snprintf(state->status, sizeof(state->status), "failed to launch editor");
-    }
-
-    load_notes(&state->notes, cfg);
-    normalize_selection(state);
-}
 
 static void handle_search_key(AppState *state, KeyEvent key) {
     size_t len = strlen(state->search);
@@ -948,6 +957,776 @@ static void handle_search_key(AppState *state, KeyEvent key) {
         state->search[len + 1] = '\0';
         normalize_selection(state);
     }
+}
+
+#define PLUGIN_NAME_MAX 64
+#define PLUGIN_DESC_MAX 256
+#define PLUGIN_AUTH_MAX 128
+
+typedef struct {
+    char name[PLUGIN_NAME_MAX];
+    char authors[PLUGIN_AUTH_MAX];
+    char description[PLUGIN_DESC_MAX];
+    char keybind;
+    char dir_path[PATH_MAX];
+    char c_path[PATH_MAX];
+    char exe_path[PATH_MAX];
+    bool is_compiled;
+    bool is_remote;
+    bool is_disabled;
+    bool update_available;
+    bool exists_on_remote;
+} Plugin;
+
+typedef struct {
+    Plugin *items;
+    size_t count;
+    size_t capacity;
+} PluginList;
+
+static void plugin_list_free(PluginList *list) {
+    free(list->items);
+    list->items = NULL;
+    list->count = 0;
+    list->capacity = 0;
+}
+
+static bool plugin_list_push(PluginList *list, const Plugin *plugin) {
+    if (list->count == list->capacity) {
+        size_t next_capacity = list->capacity ? list->capacity * 2 : 8;
+        Plugin *next = realloc(list->items, next_capacity * sizeof(*next));
+        if (!next) return false;
+        list->items = next;
+        list->capacity = next_capacity;
+    }
+    list->items[list->count++] = *plugin;
+    return true;
+}
+
+static bool is_plugin_system_enabled(const AppConfig *cfg) {
+    char state_path[PATH_MAX];
+    snprintf(state_path, sizeof(state_path), "%s" PATH_SEP "plugin_state", cfg->data_dir);
+    FILE *f = fopen(state_path, "r");
+    if (!f) {
+        return true;
+    }
+    char buf[32];
+    if (fgets(buf, sizeof(buf), f)) {
+        fclose(f);
+        return strstr(buf, "disabled") == NULL;
+    }
+    fclose(f);
+    return true;
+}
+
+static void set_plugin_system_enabled(const AppConfig *cfg, bool enabled) {
+    char state_path[PATH_MAX];
+    snprintf(state_path, sizeof(state_path), "%s" PATH_SEP "plugin_state", cfg->data_dir);
+    FILE *f = fopen(state_path, "w");
+    if (f) {
+        fprintf(f, "%s", enabled ? "enabled" : "disabled");
+        fclose(f);
+    }
+}
+
+static bool is_plugin_disabled_on_disk(const AppConfig *cfg, const char *name) {
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s" PATH_SEP "disabled_plugins", cfg->data_dir);
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+    char line[128];
+    while (fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line);
+        while (len > 0 && isspace((unsigned char)line[len - 1])) {
+            line[--len] = '\0';
+        }
+        if (strcmp(line, name) == 0) {
+            fclose(f);
+            return true;
+        }
+    }
+    fclose(f);
+    return false;
+}
+
+static void set_plugin_disabled_on_disk(const AppConfig *cfg, const char *name, bool disabled) {
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s" PATH_SEP "disabled_plugins", cfg->data_dir);
+    
+    char names[32][64];
+    size_t count = 0;
+    FILE *f = fopen(path, "r");
+    if (f) {
+        char line[128];
+        while (fgets(line, sizeof(line), f) && count < 32) {
+            size_t len = strlen(line);
+            while (len > 0 && isspace((unsigned char)line[len - 1])) {
+                line[--len] = '\0';
+            }
+            if (line[0] && strcmp(line, name) != 0) {
+                snprintf(names[count++], 64, "%s", line);
+            }
+        }
+        fclose(f);
+    }
+
+    if (disabled) {
+        if (count < 32) {
+            snprintf(names[count++], 64, "%s", name);
+        }
+    }
+
+    f = fopen(path, "w");
+    if (f) {
+        for (size_t i = 0; i < count; i++) {
+            fprintf(f, "%s\n", names[i]);
+        }
+        fclose(f);
+    }
+}
+
+static bool parse_plugin_readme(const char *readme_path, Plugin *plugin) {
+    FILE *f = fopen(readme_path, "r");
+    if (!f) return false;
+
+    char line[512];
+    plugin->name[0] = '\0';
+    plugin->authors[0] = '\0';
+    plugin->description[0] = '\0';
+    plugin->keybind = '\0';
+
+    while (fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line);
+        while (len > 0 && isspace((unsigned char)line[len - 1])) {
+            line[--len] = '\0';
+        }
+
+        if (line[0] == '#' && line[1] == ' ') {
+            char *name = line + 2;
+            while (*name && isspace((unsigned char)*name)) name++;
+            snprintf(plugin->name, sizeof(plugin->name), "%s", name);
+        } else if (strstr(line, "[authors] =") != NULL) {
+            char *p = strchr(line, '=');
+            if (p) {
+                p++;
+                while (*p && (*p == ' ' || *p == '{' || *p == '"' || *p == '\'' || *p == '[')) p++;
+                char *end = p + strlen(p);
+                while (end > p && (end[-1] == ' ' || end[-1] == '}' || end[-1] == '"' || end[-1] == '\'' || end[-1] == ']')) end--;
+                *end = '\0';
+                snprintf(plugin->authors, sizeof(plugin->authors), "%s", p);
+            }
+        } else if (strstr(line, "[description] =") != NULL) {
+            char *p = strchr(line, '=');
+            if (p) {
+                p++;
+                while (*p && (*p == ' ' || *p == '<' || *p == '"' || *p == '\'')) p++;
+                char *end = p + strlen(p);
+                while (end > p && (end[-1] == ' ' || end[-1] == '>' || end[-1] == '"' || end[-1] == '\'')) end--;
+                *end = '\0';
+                snprintf(plugin->description, sizeof(plugin->description), "%s", p);
+            }
+        } else if (strstr(line, "[keybind] =") != NULL) {
+            char *p = strchr(line, '=');
+            if (p) {
+                p++;
+                while (*p && isspace((unsigned char)*p)) p++;
+                if (*p) {
+                    plugin->keybind = *p;
+                }
+            }
+        }
+    }
+    fclose(f);
+    return plugin->name[0] != '\0';
+}
+
+static void scan_addons_dir(PluginList *list, const AppConfig *cfg, const char *addons_base_path) {
+    if (access(addons_base_path, 0) != 0) {
+        return;
+    }
+
+#ifdef _WIN32
+    char pattern[PATH_MAX];
+    snprintf(pattern, sizeof(pattern), "%s\\*", addons_base_path);
+
+    WIN32_FIND_DATAA data;
+    HANDLE find = FindFirstFileA(pattern, &data);
+    if (find == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    do {
+        if (!(data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+            continue;
+        }
+        if (strcmp(data.cFileName, ".") == 0 || strcmp(data.cFileName, "..") == 0) {
+            continue;
+        }
+
+        Plugin p;
+        memset(&p, 0, sizeof(p));
+        snprintf(p.name, sizeof(p.name), "%s", data.cFileName);
+        snprintf(p.dir_path, sizeof(p.dir_path), "%s\\%s", addons_base_path, data.cFileName);
+        snprintf(p.c_path, sizeof(p.c_path), "%s\\%s.c", p.dir_path, p.name);
+        snprintf(p.exe_path, sizeof(p.exe_path), "%s\\%s.exe", p.dir_path, p.name);
+        p.is_remote = false;
+
+        char readme_path[PATH_MAX];
+        snprintf(readme_path, sizeof(readme_path), "%s\\README.md", p.dir_path);
+        
+        if (parse_plugin_readme(readme_path, &p)) {
+            if (access(p.exe_path, 0) == 0) {
+                p.is_compiled = true;
+            }
+            p.is_disabled = is_plugin_disabled_on_disk(cfg, p.name);
+            bool dup = false;
+            for (size_t i = 0; i < list->count; i++) {
+                if (strcmp(list->items[i].name, p.name) == 0) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) {
+                plugin_list_push(list, &p);
+            }
+        }
+    } while (FindNextFileA(find, &data));
+    FindClose(find);
+#else
+    DIR *dir = opendir(addons_base_path);
+    if (!dir) {
+        return;
+    }
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s/%s", addons_base_path, entry->d_name);
+        struct stat st;
+        if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+            Plugin p;
+            memset(&p, 0, sizeof(p));
+            snprintf(p.name, sizeof(p.name), "%s", entry->d_name);
+            snprintf(p.dir_path, sizeof(p.dir_path), "%s/%s", addons_base_path, entry->d_name);
+            snprintf(p.c_path, sizeof(p.c_path), "%s/%s.c", p.dir_path, p.name);
+            snprintf(p.exe_path, sizeof(p.exe_path), "%s/%s", p.dir_path, p.name);
+            p.is_remote = false;
+
+            char readme_path[PATH_MAX];
+            snprintf(readme_path, sizeof(readme_path), "%s/README.md", p.dir_path);
+            
+            if (parse_plugin_readme(readme_path, &p)) {
+                if (access(p.exe_path, 0) == 0) {
+                    p.is_compiled = true;
+                }
+                p.is_disabled = is_plugin_disabled_on_disk(cfg, p.name);
+                bool dup = false;
+                for (size_t i = 0; i < list->count; i++) {
+                    if (strcmp(list->items[i].name, p.name) == 0) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup) {
+                    plugin_list_push(list, &p);
+                }
+            }
+        }
+    }
+    closedir(dir);
+#endif
+}
+
+static bool files_are_different(const char *path1, const char *path2) {
+    FILE *f1 = fopen(path1, "rb");
+    FILE *f2 = fopen(path2, "rb");
+    if (!f1 || !f2) {
+        if (f1) fclose(f1);
+        if (f2) fclose(f2);
+        return true;
+    }
+    int c1, c2;
+    do {
+        c1 = fgetc(f1);
+        c2 = fgetc(f2);
+        if (c1 != c2) {
+            fclose(f1);
+            fclose(f2);
+            return true;
+        }
+    } while (c1 != EOF && c2 != EOF);
+    fclose(f1);
+    fclose(f2);
+    return false;
+}
+
+static void fetch_remote_plugins(AppState *state, const AppConfig *cfg, PluginList *list) {
+    clear_owned_region(state);
+    disable_raw_mode();
+    enter_alt_screen();
+    printf("Fetching remote plugin repository index...\n");
+    fflush(stdout);
+
+    char temp_index[PATH_MAX];
+    snprintf(temp_index, sizeof(temp_index), "%s" PATH_SEP "temp_addons.txt", cfg->data_dir);
+
+    char cmd[PATH_MAX * 2 + 128];
+    snprintf(cmd, sizeof(cmd), "curl -s -f -L \"https://raw.githubusercontent.com/aaravmaloo/blob-addons/main/addons.txt\" -o \"%s\"", temp_index);
+    
+    int ret = system(cmd);
+    if (ret != 0) {
+        printf("Error: failed to fetch remote plugins (network error or curl missing).\n");
+        printf("Press any key to continue...");
+        fflush(stdout);
+        read_key();
+        exit_alt_screen();
+        enable_raw_mode();
+        return;
+    }
+
+    FILE *f = fopen(temp_index, "r");
+    if (!f) {
+        exit_alt_screen();
+        enable_raw_mode();
+        return;
+    }
+
+    char line[128];
+    while (fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line);
+        while (len > 0 && isspace((unsigned char)line[len - 1])) {
+            line[--len] = '\0';
+        }
+        if (len == 0) continue;
+
+        Plugin *existing = NULL;
+        for (size_t i = 0; i < list->count; i++) {
+            if (strcmp(list->items[i].name, line) == 0) {
+                existing = &list->items[i];
+                break;
+            }
+        }
+
+        if (existing) {
+            existing->exists_on_remote = true;
+            if (existing->is_compiled) {
+                char temp_c[PATH_MAX];
+                snprintf(temp_c, sizeof(temp_c), "%s" PATH_SEP "temp_update_%s.c", cfg->data_dir, line);
+                snprintf(cmd, sizeof(cmd), "curl -s -f -L \"https://raw.githubusercontent.com/aaravmaloo/blob-addons/main/addons/%s/%s.c\" -o \"%s\"", line, line, temp_c);
+                if (system(cmd) == 0) {
+                    if (files_are_different(temp_c, existing->c_path)) {
+                        existing->update_available = true;
+                    }
+                    unlink(temp_c);
+                }
+            }
+            continue;
+        }
+
+        char temp_readme[PATH_MAX];
+        snprintf(temp_readme, sizeof(temp_readme), "%s" PATH_SEP "temp_readme_%s.md", cfg->data_dir, line);
+        
+        snprintf(cmd, sizeof(cmd), "curl -s -f -L \"https://raw.githubusercontent.com/aaravmaloo/blob-addons/main/addons/%s/README.md\" -o \"%s\"", line, temp_readme);
+        if (system(cmd) == 0) {
+            Plugin p;
+            memset(&p, 0, sizeof(p));
+            snprintf(p.name, sizeof(p.name), "%s", line);
+            snprintf(p.dir_path, sizeof(p.dir_path), "%s" PATH_SEP "%s", cfg->addons_dir, line);
+            snprintf(p.c_path, sizeof(p.c_path), "%s" PATH_SEP "%s.c", p.dir_path, p.name);
+#ifdef _WIN32
+            snprintf(p.exe_path, sizeof(p.exe_path), "%s" PATH_SEP "%s.exe", p.dir_path, p.name);
+#else
+            snprintf(p.exe_path, sizeof(p.exe_path), "%s" PATH_SEP "%s", p.dir_path, p.name);
+#endif
+            p.is_remote = true;
+            p.exists_on_remote = true;
+            p.is_compiled = false;
+            p.is_disabled = is_plugin_disabled_on_disk(cfg, p.name);
+
+            if (parse_plugin_readme(temp_readme, &p)) {
+                plugin_list_push(list, &p);
+            }
+            unlink(temp_readme);
+        }
+    }
+    fclose(f);
+    unlink(temp_index);
+
+    exit_alt_screen();
+    enable_raw_mode();
+}
+
+static bool compile_plugin(AppState *state, const AppConfig *cfg, Plugin *plugin) {
+    (void)cfg;
+    clear_owned_region(state);
+    disable_raw_mode();
+    enter_alt_screen();
+
+    ensure_dir(plugin->dir_path);
+
+    char cmd[PATH_MAX * 2 + 128];
+
+    if (plugin->is_remote || plugin->update_available) {
+        printf("Downloading plugin source files...\n");
+        fflush(stdout);
+        
+        snprintf(cmd, sizeof(cmd), "curl -s -f -L \"https://raw.githubusercontent.com/aaravmaloo/blob-addons/main/addons/%s/%s.c\" -o \"%s\"", plugin->name, plugin->name, plugin->c_path);
+        if (system(cmd) != 0) {
+            printf("Error: failed to download C source file.\nPress any key to continue...");
+            fflush(stdout);
+            read_key();
+            exit_alt_screen();
+            enable_raw_mode();
+            return false;
+        }
+
+        char readme_path[PATH_MAX];
+        snprintf(readme_path, sizeof(readme_path), "%s" PATH_SEP "README.md", plugin->dir_path);
+        snprintf(cmd, sizeof(cmd), "curl -s -f -L \"https://raw.githubusercontent.com/aaravmaloo/blob-addons/main/addons/%s/README.md\" -o \"%s\"", plugin->name, readme_path);
+        system(cmd);
+    }
+
+    printf("Compiling plugin %s with optimizations...\n", plugin->name);
+    fflush(stdout);
+
+#ifdef _WIN32
+    snprintf(cmd, sizeof(cmd), "gcc -Os -s \"%s\" -o \"%s\"", plugin->c_path, plugin->exe_path);
+#else
+    snprintf(cmd, sizeof(cmd), "cc -Os -s \"%s\" -o \"%s\"", plugin->c_path, plugin->exe_path);
+#endif
+
+    int ret = system(cmd);
+    if (ret != 0) {
+        printf("Compilation failed. Error code: %d\n", ret);
+        printf("Make sure a C compiler (gcc/cc) is installed and in your PATH.\n");
+        printf("Press any key to continue...");
+        fflush(stdout);
+        read_key();
+        exit_alt_screen();
+        enable_raw_mode();
+        return false;
+    }
+
+    printf("Successfully compiled and installed: %s\n", plugin->name);
+    printf("Press any key to continue...");
+    fflush(stdout);
+    read_key();
+
+    exit_alt_screen();
+    enable_raw_mode();
+
+    plugin->is_compiled = true;
+    plugin->is_remote = false;
+    plugin->update_available = false;
+    return true;
+}
+
+static void delete_plugin(AppState *state, PluginList *list, size_t *selected, bool check_remote) {
+    (void)check_remote;
+    if (list->count == 0 || *selected >= list->count) return;
+    Plugin *plugin = &list->items[*selected];
+
+    char prompt_msg[128];
+    snprintf(prompt_msg, sizeof(prompt_msg), "Uninstall plugin %s (delete compiled binary)?", plugin->name);
+    if (!prompt_confirm(state, prompt_msg)) {
+        return;
+    }
+    clear_owned_region(state);
+    disable_raw_mode();
+    enter_alt_screen();
+
+    unlink(plugin->exe_path);
+
+    printf("Plugin binary uninstalled.\nPress any key to continue...");
+    fflush(stdout);
+    read_key();
+
+    exit_alt_screen();
+    enable_raw_mode();
+
+    plugin->is_compiled = false;
+    plugin->update_available = false;
+}
+
+static bool run_plugin_process(const char *exe_path, const char *note_path) {
+#ifdef _WIN32
+    char command[PATH_MAX * 2 + 16];
+    snprintf(command, sizeof(command), "\"%s\" \"%s\"", exe_path, note_path);
+
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si));
+    ZeroMemory(&pi, sizeof(pi));
+    si.cb = sizeof(si);
+
+    bool ok = CreateProcessA(NULL, command, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi) != 0;
+    if (ok) {
+        WaitForSingleObject(pi.hProcess, INFINITE);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+    return ok;
+#else
+    pid_t pid = fork();
+    if (pid == 0) {
+        char *argv[] = {(char *)exe_path, (char *)note_path, NULL};
+        execvp(exe_path, argv);
+        _exit(127);
+    } else if (pid > 0) {
+        int status = 0;
+        while (waitpid(pid, &status, 0) == -1 && errno == EINTR) {
+        }
+        return status == 0;
+    }
+    return false;
+#endif
+}
+
+static void run_plugin_on_note(AppState *state, const Plugin *plugin, const char *note_path) {
+    clear_owned_region(state);
+    disable_raw_mode();
+    enter_alt_screen();
+
+    printf("Executing plugin: %s...\n", plugin->name);
+    fflush(stdout);
+
+    if (!run_plugin_process(plugin->exe_path, note_path)) {
+        printf("\nPlugin execution failed.\nPress any key to continue...");
+        fflush(stdout);
+        read_key();
+    }
+
+    exit_alt_screen();
+    enable_raw_mode();
+    state->rendered_lines = 0;
+}
+
+static void render_plugin_ui(AppState *state, PluginList *plugins, size_t selected_plugin) {
+    normalize_selection(state);
+    clear_owned_region(state);
+
+    render_line(state, ANSI_BOLD "blob: plugins manager" ANSI_RESET);
+    render_line(state, "");
+
+    if (plugins->count == 0) {
+        render_line(state, ANSI_DIM "no plugins found" ANSI_RESET);
+    } else {
+        for (size_t i = 0; i < plugins->count; i++) {
+            Plugin *p = &plugins->items[i];
+            char line[256];
+            char status[32] = "";
+            if (p->is_disabled) {
+                snprintf(status, sizeof(status), "[disabled]");
+            } else if (p->is_compiled) {
+                if (p->update_available) {
+                    snprintf(status, sizeof(status), "[update available]");
+                } else {
+                    snprintf(status, sizeof(status), "[installed]");
+                }
+            } else if (p->is_remote) {
+                snprintf(status, sizeof(status), "[remote]");
+            } else {
+                snprintf(status, sizeof(status), "[not compiled]");
+            }
+
+            snprintf(line, sizeof(line), "%s %-15s %s",
+                     i == selected_plugin ? ">" : " ",
+                     p->name, status);
+            render_line(state, line);
+        }
+    }
+
+    render_line(state, "");
+    render_line(state, ANSI_DIM "────────────────────────────────" ANSI_RESET);
+    render_line(state, "");
+
+    if (plugins->count > 0 && selected_plugin < plugins->count) {
+        Plugin *p = &plugins->items[selected_plugin];
+        char line[512];
+        snprintf(line, sizeof(line), "Author:      %s", p->authors[0] ? p->authors : "Unknown");
+        render_line(state, line);
+        snprintf(line, sizeof(line), "Description: %s", p->description[0] ? p->description : "None");
+        render_line(state, line);
+        snprintf(line, sizeof(line), "Keybind:     %c", p->keybind ? p->keybind : ' ');
+        render_line(state, line);
+        render_line(state, "");
+    }
+
+    render_line(state, ANSI_DIM "[ENTER] install/compile/update" ANSI_RESET);
+    render_line(state, ANSI_DIM "[u] uninstall (delete binary)" ANSI_RESET);
+    render_line(state, ANSI_DIM "[t] toggle enable/disable" ANSI_RESET);
+    render_line(state, ANSI_DIM "[Ctrl+P] disable plugin system" ANSI_RESET);
+    render_line(state, ANSI_DIM "[ESC/q] back to notes" ANSI_RESET);
+
+    if (state->status[0]) {
+        render_line(state, "");
+        char status_line[INPUT_MAX + 16];
+        snprintf(status_line, sizeof(status_line), ANSI_RED "%s" ANSI_RESET, state->status);
+        render_line(state, status_line);
+        state->status[0] = '\0';
+    }
+
+    fflush(stdout);
+}
+
+static void plugin_manager_flow(AppState *state, const AppConfig *cfg) {
+    PluginList plugins = {NULL, 0, 0};
+
+    scan_addons_dir(&plugins, cfg, cfg->addons_dir);
+    scan_addons_dir(&plugins, cfg, "addons");
+
+    bool check_remote = false;
+    if (is_plugin_system_enabled(cfg)) {
+        check_remote = prompt_confirm(state, "Access remote repository?");
+    } else {
+        if (prompt_confirm(state, "Plugin system is disabled. Enable it?")) {
+            set_plugin_system_enabled(cfg, true);
+            check_remote = prompt_confirm(state, "Access remote repository?");
+        } else {
+            plugin_list_free(&plugins);
+            return;
+        }
+    }
+
+    if (check_remote) {
+        fetch_remote_plugins(state, cfg, &plugins);
+    }
+
+    size_t selected = 0;
+    bool in_menu = true;
+
+    while (in_menu) {
+        render_plugin_ui(state, &plugins, selected);
+        KeyEvent key = read_key();
+
+        if (key.type == KEY_UP) {
+            if (selected > 0) selected--;
+        } else if (key.type == KEY_DOWN) {
+            if (plugins.count > 0 && selected + 1 < plugins.count) selected++;
+        } else if (key.type == KEY_ESCAPE || (key.type == KEY_CHAR && key.ch == 'q')) {
+            in_menu = false;
+        } else if (key.type == KEY_CTRL_P) {
+            if (prompt_confirm(state, "Disable plugin interface completely?")) {
+                set_plugin_system_enabled(cfg, false);
+                in_menu = false;
+            }
+        } else if (key.type == KEY_ENTER) {
+            if (plugins.count > 0 && selected < plugins.count) {
+                Plugin *p = &plugins.items[selected];
+                if (!p->is_compiled || p->update_available) {
+                    compile_plugin(state, cfg, p);
+                } else {
+                    snprintf(state->status, sizeof(state->status), "Already compiled. Press '%c' on notes list.", p->keybind);
+                }
+            }
+        } else if (key.type == KEY_CHAR && key.ch == 'u') {
+            if (plugins.count > 0 && selected < plugins.count) {
+                Plugin *p = &plugins.items[selected];
+                if (p->is_compiled || !p->is_remote) {
+                    delete_plugin(state, &plugins, &selected, check_remote);
+                }
+            }
+        } else if (key.type == KEY_CHAR && key.ch == 't') {
+            if (plugins.count > 0 && selected < plugins.count) {
+                Plugin *p = &plugins.items[selected];
+                p->is_disabled = !p->is_disabled;
+                set_plugin_disabled_on_disk(cfg, p->name, p->is_disabled);
+                snprintf(state->status, sizeof(state->status), "%s %s.", p->name, p->is_disabled ? "disabled" : "enabled");
+            }
+        }
+    }
+
+    plugin_list_free(&plugins);
+    state->rendered_lines = 0;
+}
+
+static bool is_note_encrypted(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    char buf[64];
+    size_t r = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    if (r < 21) return false;
+    buf[r] = '\0';
+    return (strncmp(buf, "--- BLOB CRYPT V1 ---", 21) == 0) ||
+           (strncmp(buf, "--- BLOB CRYPT V2 ---", 21) == 0);
+}
+
+static void open_selected_note(AppState *state, const AppConfig *cfg) {
+    if (state->notes.count == 0 || !selected_is_visible(state)) {
+        return;
+    }
+
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s", state->notes.items[state->selected].path);
+
+    bool encrypted = is_note_encrypted(path);
+    bool unlocked = false;
+
+    if (encrypted) {
+        PluginList temp_plugins = {NULL, 0, 0};
+        scan_addons_dir(&temp_plugins, cfg, cfg->addons_dir);
+        scan_addons_dir(&temp_plugins, cfg, "addons");
+
+        Plugin *lock_plugin = NULL;
+        for (size_t i = 0; i < temp_plugins.count; i++) {
+            if (strcmp(temp_plugins.items[i].name, "lock") == 0 && temp_plugins.items[i].is_compiled) {
+                lock_plugin = &temp_plugins.items[i];
+                break;
+            }
+        }
+
+        if (lock_plugin) {
+            run_plugin_on_note(state, lock_plugin, path);
+            if (!is_note_encrypted(path)) {
+                unlocked = true;
+            } else {
+                plugin_list_free(&temp_plugins);
+                return;
+            }
+        } else {
+            snprintf(state->status, sizeof(state->status), "Note is locked, but 'lock' plugin is not installed.");
+            plugin_list_free(&temp_plugins);
+            return;
+        }
+
+        plugin_list_free(&temp_plugins);
+    }
+
+    if (!open_path_in_editor(state, cfg, path)) {
+        snprintf(state->status, sizeof(state->status), "failed to launch editor");
+    }
+
+    if (unlocked) {
+        PluginList temp_plugins = {NULL, 0, 0};
+        scan_addons_dir(&temp_plugins, cfg, cfg->addons_dir);
+        scan_addons_dir(&temp_plugins, cfg, "addons");
+
+        Plugin *lock_plugin = NULL;
+        for (size_t i = 0; i < temp_plugins.count; i++) {
+            if (strcmp(temp_plugins.items[i].name, "lock") == 0 && temp_plugins.items[i].is_compiled) {
+                lock_plugin = &temp_plugins.items[i];
+                break;
+            }
+        }
+
+        if (lock_plugin) {
+            printf("\nRe-encrypting note...\n");
+            fflush(stdout);
+            run_plugin_on_note(state, lock_plugin, path);
+        }
+        plugin_list_free(&temp_plugins);
+    }
+
+    printf("\033[2J\033[H");
+    fflush(stdout);
+
+    load_notes(&state->notes, cfg);
+    normalize_selection(state);
 }
 
 #ifndef BLOB_TEST
@@ -993,7 +1772,27 @@ static void handle_key(AppState *state, const AppConfig *cfg, KeyEvent key) {
         state->search[0] = '\0';
         normalize_selection(state);
         break;
+    case 'p':
+        plugin_manager_flow(state, cfg);
+        break;
     default:
+        if (is_plugin_system_enabled(cfg) && state->notes.count > 0 && selected_is_visible(state)) {
+            PluginList temp_plugins = {NULL, 0, 0};
+            scan_addons_dir(&temp_plugins, cfg, cfg->addons_dir);
+            scan_addons_dir(&temp_plugins, cfg, "addons");
+
+            for (size_t i = 0; i < temp_plugins.count; i++) {
+                Plugin *p = &temp_plugins.items[i];
+                if (p->is_compiled && !p->is_disabled && p->keybind == key.ch) {
+                    run_plugin_on_note(state, p, state->notes.items[state->selected].path);
+                    plugin_list_free(&temp_plugins);
+                    load_notes(&state->notes, cfg);
+                    normalize_selection(state);
+                    return;
+                }
+            }
+            plugin_list_free(&temp_plugins);
+        }
         break;
     }
 }
