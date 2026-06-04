@@ -39,17 +39,23 @@ endif
 
 # Targets
 TARGET = blob$(EXE)
+TEST_TARGET = tests$(EXE)
 SRC = main.c
+TEST_SRC = tests.c
 
-.PHONY: all clean release
+.PHONY: all clean release test
 
 all: $(TARGET)
 
 $(TARGET): $(SRC)
 	$(CC) $(CFLAGS) $(SRC) -o $(TARGET) $(LDFLAGS)
 
+test: $(TEST_SRC) $(SRC)
+	$(CC) $(CFLAGS) $(TEST_SRC) -o $(TEST_TARGET) $(LDFLAGS)
+	./$(TEST_TARGET)
+
 release: $(SRC)
 	$(CC) $(CFLAGS) $(RELEASE_FLAGS) $(SRC) -o $(TARGET) $(LDFLAGS)
 
 clean:
-	-$(RM) $(TARGET)
+	-$(RM) $(TARGET) $(TEST_TARGET)
