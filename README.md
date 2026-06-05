@@ -1,8 +1,8 @@
 <h1 align="center">blob: minimal note manager</h1>
 
 <p align="center">
-  <img src="https://img.shields.io/github/actions/workflow/status/aaravmaloo/apm/ci.yml?label=build&style=flat-square" />
-  <img src="https://img.shields.io/github/v/release/aaravmaloo/apm?style=flat-square" />
+  <img src="https://img.shields.io/github/actions/workflow/status/aaravmaloo/blob/ci.yml?label=build&style=flat-square" />
+  <img src="https://img.shields.io/github/v/release/aaravmaloo/blob?style=flat-square" />
   <img src="https://img.shields.io/badge/license-GPL--2.0-green?style=flat-square" />
   <img src="https://img.shields.io/badge/language-C-blue?style=flat-square" />
 </p>
