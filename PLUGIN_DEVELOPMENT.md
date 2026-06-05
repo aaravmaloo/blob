@@ -104,5 +104,6 @@ int main(int argc, char **argv) {
 
 To distribute your addon:
 1. Write the source `.c` and `README.md` manifest.
-2. Submit a PR or add it to the remote repository.
-3. Users will see it in the remote repository list when they press `p`, and `blob` will download and compile it on-device automatically!
+2. Add your plugin name to the `addons/addons.txt` index file in the repository.
+3. Submit a PR or add it to the remote repository.
+4. Users will see it in the remote repository list when they press `p`, and `blob` will download and compile it on-device automatically!
