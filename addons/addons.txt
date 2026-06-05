@@ -1,1 +1,4 @@
 lock
+stats
+archive
+git-sync
