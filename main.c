@@ -1392,7 +1392,17 @@ static bool compile_plugin(AppState *state, const AppConfig *cfg, Plugin *plugin
 
         char new_c[PATH_MAX];
         snprintf(new_c, sizeof(new_c), "%s" PATH_SEP "%s.c", new_dir, plugin->name);
-        copy_file(plugin->c_path, new_c);
+        if (!copy_file(plugin->c_path, new_c)) {
+            printf("Error: failed to copy source file to data directory.\n");
+            printf("Source: %s\n", plugin->c_path);
+            printf("Dest: %s\n", new_c);
+            printf("Press any key to continue...");
+            fflush(stdout);
+            read_key();
+            exit_alt_screen();
+            enable_raw_mode();
+            return false;
+        }
 
         char old_readme[PATH_MAX];
         snprintf(old_readme, sizeof(old_readme), "%s" PATH_SEP "README.md", plugin->dir_path);
@@ -1400,7 +1410,7 @@ static bool compile_plugin(AppState *state, const AppConfig *cfg, Plugin *plugin
         snprintf(new_readme, sizeof(new_readme), "%s" PATH_SEP "README.md", new_dir);
         copy_file(old_readme, new_readme);
 
-        // Update paths to point to the data directory version
+        // Update paths only after successful copy
         snprintf(plugin->dir_path, sizeof(plugin->dir_path), "%s", new_dir);
         snprintf(plugin->c_path, sizeof(plugin->c_path), "%s", new_c);
 #ifdef _WIN32
