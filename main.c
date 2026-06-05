@@ -1275,7 +1275,7 @@ static void fetch_remote_plugins(AppState *state, const AppConfig *cfg, PluginLi
     snprintf(temp_index, sizeof(temp_index), "%s" PATH_SEP "temp_addons.txt", cfg->data_dir);
 
     char cmd[PATH_MAX * 2 + 128];
-    snprintf(cmd, sizeof(cmd), "curl -s -f -L \"https://raw.githubusercontent.com/aaravmaloo/blob-addons/main/addons.txt\" -o \"%s\"", temp_index);
+    snprintf(cmd, sizeof(cmd), "curl -s -f -L \"https://raw.githubusercontent.com/aaravmaloo/blob/master/addons/addons.txt\" -o \"%s\"", temp_index);
     
     int ret = system(cmd);
     if (ret != 0) {
@@ -1316,7 +1316,7 @@ static void fetch_remote_plugins(AppState *state, const AppConfig *cfg, PluginLi
             if (existing->is_compiled) {
                 char temp_c[PATH_MAX];
                 snprintf(temp_c, sizeof(temp_c), "%s" PATH_SEP "temp_update_%s.c", cfg->data_dir, line);
-                snprintf(cmd, sizeof(cmd), "curl -s -f -L \"https://raw.githubusercontent.com/aaravmaloo/blob-addons/main/addons/%s/%s.c\" -o \"%s\"", line, line, temp_c);
+                snprintf(cmd, sizeof(cmd), "curl -s -f -L \"https://raw.githubusercontent.com/aaravmaloo/blob/master/addons/%s/%s.c\" -o \"%s\"", line, line, temp_c);
                 if (system(cmd) == 0) {
                     if (files_are_different(temp_c, existing->c_path)) {
                         existing->update_available = true;
@@ -1330,7 +1330,7 @@ static void fetch_remote_plugins(AppState *state, const AppConfig *cfg, PluginLi
         char temp_readme[PATH_MAX];
         snprintf(temp_readme, sizeof(temp_readme), "%s" PATH_SEP "temp_readme_%s.md", cfg->data_dir, line);
         
-        snprintf(cmd, sizeof(cmd), "curl -s -f -L \"https://raw.githubusercontent.com/aaravmaloo/blob-addons/main/addons/%s/README.md\" -o \"%s\"", line, temp_readme);
+        snprintf(cmd, sizeof(cmd), "curl -s -f -L \"https://raw.githubusercontent.com/aaravmaloo/blob/master/addons/%s/README.md\" -o \"%s\"", line, temp_readme);
         if (system(cmd) == 0) {
             Plugin p;
             memset(&p, 0, sizeof(p));
@@ -1360,11 +1360,55 @@ static void fetch_remote_plugins(AppState *state, const AppConfig *cfg, PluginLi
     enable_raw_mode();
 }
 
+static bool copy_file(const char *src, const char *dst) {
+    FILE *fsrc = fopen(src, "rb");
+    if (!fsrc) return false;
+    FILE *fdst = fopen(dst, "wb");
+    if (!fdst) {
+        fclose(fsrc);
+        return false;
+    }
+    char buf[8192];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), fsrc)) > 0) {
+        fwrite(buf, 1, n, fdst);
+    }
+    fclose(fsrc);
+    fclose(fdst);
+    return true;
+}
+
 static bool compile_plugin(AppState *state, const AppConfig *cfg, Plugin *plugin) {
-    (void)cfg;
     clear_owned_region(state);
     disable_raw_mode();
     enter_alt_screen();
+
+    // If it's a local plugin not in the data directory, "install" it by copying it there
+    if (!plugin->is_remote && strstr(plugin->dir_path, cfg->addons_dir) == NULL) {
+        printf("Installing local plugin to data directory...\n");
+        char new_dir[PATH_MAX];
+        snprintf(new_dir, sizeof(new_dir), "%s" PATH_SEP "%s", cfg->addons_dir, plugin->name);
+        ensure_dir(new_dir);
+
+        char new_c[PATH_MAX];
+        snprintf(new_c, sizeof(new_c), "%s" PATH_SEP "%s.c", new_dir, plugin->name);
+        copy_file(plugin->c_path, new_c);
+
+        char old_readme[PATH_MAX];
+        snprintf(old_readme, sizeof(old_readme), "%s" PATH_SEP "README.md", plugin->dir_path);
+        char new_readme[PATH_MAX];
+        snprintf(new_readme, sizeof(new_readme), "%s" PATH_SEP "README.md", new_dir);
+        copy_file(old_readme, new_readme);
+
+        // Update paths to point to the data directory version
+        snprintf(plugin->dir_path, sizeof(plugin->dir_path), "%s", new_dir);
+        snprintf(plugin->c_path, sizeof(plugin->c_path), "%s", new_c);
+#ifdef _WIN32
+        snprintf(plugin->exe_path, sizeof(plugin->exe_path), "%s" PATH_SEP "%s.exe", plugin->dir_path, plugin->name);
+#else
+        snprintf(plugin->exe_path, sizeof(plugin->exe_path), "%s" PATH_SEP "%s", plugin->dir_path, plugin->name);
+#endif
+    }
 
     ensure_dir(plugin->dir_path);
 
@@ -1374,7 +1418,7 @@ static bool compile_plugin(AppState *state, const AppConfig *cfg, Plugin *plugin
         printf("Downloading plugin source files...\n");
         fflush(stdout);
         
-        snprintf(cmd, sizeof(cmd), "curl -s -f -L \"https://raw.githubusercontent.com/aaravmaloo/blob-addons/main/addons/%s/%s.c\" -o \"%s\"", plugin->name, plugin->name, plugin->c_path);
+        snprintf(cmd, sizeof(cmd), "curl -s -f -L \"https://raw.githubusercontent.com/aaravmaloo/blob/master/addons/%s/%s.c\" -o \"%s\"", plugin->name, plugin->name, plugin->c_path);
         if (system(cmd) != 0) {
             printf("Error: failed to download C source file.\nPress any key to continue...");
             fflush(stdout);
@@ -1386,7 +1430,7 @@ static bool compile_plugin(AppState *state, const AppConfig *cfg, Plugin *plugin
 
         char readme_path[PATH_MAX];
         snprintf(readme_path, sizeof(readme_path), "%s" PATH_SEP "README.md", plugin->dir_path);
-        snprintf(cmd, sizeof(cmd), "curl -s -f -L \"https://raw.githubusercontent.com/aaravmaloo/blob-addons/main/addons/%s/README.md\" -o \"%s\"", plugin->name, readme_path);
+        snprintf(cmd, sizeof(cmd), "curl -s -f -L \"https://raw.githubusercontent.com/aaravmaloo/blob/master/addons/%s/README.md\" -o \"%s\"", plugin->name, readme_path);
         system(cmd);
     }
 
@@ -1425,13 +1469,13 @@ static bool compile_plugin(AppState *state, const AppConfig *cfg, Plugin *plugin
     return true;
 }
 
-static void delete_plugin(AppState *state, PluginList *list, size_t *selected, bool check_remote) {
+static void delete_plugin(AppState *state, const AppConfig *cfg, PluginList *list, size_t *selected, bool check_remote) {
     (void)check_remote;
     if (list->count == 0 || *selected >= list->count) return;
     Plugin *plugin = &list->items[*selected];
 
     char prompt_msg[128];
-    snprintf(prompt_msg, sizeof(prompt_msg), "Uninstall plugin %s (delete compiled binary)?", plugin->name);
+    snprintf(prompt_msg, sizeof(prompt_msg), "Uninstall plugin %s (delete files)?", plugin->name);
     if (!prompt_confirm(state, prompt_msg)) {
         return;
     }
@@ -1440,8 +1484,15 @@ static void delete_plugin(AppState *state, PluginList *list, size_t *selected, b
     enter_alt_screen();
 
     unlink(plugin->exe_path);
+    // If it's in the data directory, clean up the source and readme as well
+    if (strstr(plugin->dir_path, cfg->addons_dir) != NULL) {
+        unlink(plugin->c_path);
+        char readme_path[PATH_MAX];
+        snprintf(readme_path, sizeof(readme_path), "%s" PATH_SEP "README.md", plugin->dir_path);
+        unlink(readme_path);
+    }
 
-    printf("Plugin binary uninstalled.\nPress any key to continue...");
+    printf("Plugin uninstalled.\nPress any key to continue...");
     fflush(stdout);
     read_key();
 
@@ -1627,7 +1678,7 @@ static void plugin_manager_flow(AppState *state, const AppConfig *cfg) {
             if (plugins.count > 0 && selected < plugins.count) {
                 Plugin *p = &plugins.items[selected];
                 if (p->is_compiled || !p->is_remote) {
-                    delete_plugin(state, &plugins, &selected, check_remote);
+                    delete_plugin(state, cfg, &plugins, &selected, check_remote);
                 }
             }
         } else if (key.type == KEY_CHAR && key.ch == 't') {
