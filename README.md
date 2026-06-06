@@ -25,7 +25,12 @@
 In the future, blob will support themes. For now, you can configure the editor that blob will use to edit the notes. This can be set via the `EDITOR` environment variable, and will force blob to use that editor. 
 
 ## Installation
-blob can be installed via [github releases](https://github.com/aaravmaloo/blob/releases), or can be compiled from scratch. 
+blob can be installed via yay, [github releases](https://github.com/aaravmaloo/blob/releases), or can be compiled from scratch. 
+
+To install it using yay (arch linux), use the following command. 
+`yay -S blob-bin`
+and you will be good to go!
+
 To compile from scratch, use the following steps.
 clone:
 
