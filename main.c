@@ -390,9 +390,16 @@ static void init_paths(AppConfig *cfg) {
     snprintf(cfg->notes_dir, sizeof(cfg->notes_dir), "%s" PATH_SEP "notes", cfg->data_dir);
     snprintf(cfg->addons_dir, sizeof(cfg->addons_dir), "%s" PATH_SEP "addons", cfg->data_dir);
 
-    ensure_dir(cfg->data_dir);
-    ensure_dir(cfg->notes_dir);
-    ensure_dir(cfg->addons_dir);
+    // Initial setup diagnostics
+    if (!ensure_dir(cfg->data_dir)) {
+        fprintf(stderr, "Warning: could not ensure data_dir: %s\n", cfg->data_dir);
+    }
+    if (!ensure_dir(cfg->notes_dir)) {
+        fprintf(stderr, "Warning: could not ensure notes_dir: %s\n", cfg->notes_dir);
+    }
+    if (!ensure_dir(cfg->addons_dir)) {
+        fprintf(stderr, "Warning: could not ensure addons_dir: %s\n", cfg->addons_dir);
+    }
 }
 #endif
 
@@ -688,7 +695,7 @@ static void render_ui(AppState *state) {
     normalize_selection(state);
     clear_owned_region(state);
 
-    render_line(state, ANSI_BOLD "blob" ANSI_RESET);
+    render_line(state, ANSI_BOLD "blob v1.0.0-debug" ANSI_RESET);
     render_line(state, "");
 
     if (state->search_mode || state->search[0]) {
@@ -871,9 +878,9 @@ static bool open_path_in_editor(AppState *state, const AppConfig *cfg, const cha
     ZeroMemory(&si, sizeof(si));
     ZeroMemory(&pi, sizeof(pi));
     si.cb = sizeof(si);
+bool ok = CreateProcessA(NULL, command, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi) != 0;
+if (ok) {
 
-    bool ok = CreateProcessA(NULL, command, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi) != 0;
-    if (ok) {
         WaitForSingleObject(pi.hProcess, INFINITE);
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
@@ -1076,21 +1083,21 @@ static bool is_plugin_disabled_on_disk(const AppConfig *cfg, const char *name) {
 }
 
 static void set_plugin_disabled_on_disk(const AppConfig *cfg, const char *name, bool disabled) {
-    char path[PATH_MAX];
+    char path[PATH_MAX + 64];
     snprintf(path, sizeof(path), "%s" PATH_SEP "disabled_plugins", cfg->data_dir);
     
-    char names[32][64];
+    char names[32][PLUGIN_NAME_MAX];
     size_t count = 0;
     FILE *f = fopen(path, "r");
     if (f) {
-        char line[128];
+        char line[PLUGIN_NAME_MAX + 64];
         while (fgets(line, sizeof(line), f) && count < 32) {
             size_t len = strlen(line);
             while (len > 0 && isspace((unsigned char)line[len - 1])) {
                 line[--len] = '\0';
             }
             if (line[0] && strcmp(line, name) != 0) {
-                snprintf(names[count++], 64, "%s", line);
+                snprintf(names[count++], PLUGIN_NAME_MAX, "%s", line);
             }
         }
         fclose(f);
@@ -1098,7 +1105,7 @@ static void set_plugin_disabled_on_disk(const AppConfig *cfg, const char *name, 
 
     if (disabled) {
         if (count < 32) {
-            snprintf(names[count++], 64, "%s", name);
+            snprintf(names[count++], PLUGIN_NAME_MAX, "%s", name);
         }
     }
 
@@ -1549,9 +1556,9 @@ static bool run_plugin_process(const char *exe_path, const char *note_path) {
     ZeroMemory(&si, sizeof(si));
     ZeroMemory(&pi, sizeof(pi));
     si.cb = sizeof(si);
+bool ok = CreateProcessA(NULL, command, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi) != 0;
+if (ok) {
 
-    bool ok = CreateProcessA(NULL, command, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi) != 0;
-    if (ok) {
         WaitForSingleObject(pi.hProcess, INFINITE);
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
