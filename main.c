@@ -327,12 +327,34 @@ static void clear_owned_region(AppState *state) {
 
 static bool ensure_dir(const char *path) {
     struct stat st;
-
     if (stat(path, &st) == 0) {
         return STAT_ISDIR(st.st_mode);
     }
 
-    return mkdir(path, 0755) == 0 || errno == EEXIST;
+    char tmp[PATH_MAX];
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    size_t len = strlen(tmp);
+    if (len >= PATH_MAX) return false;
+
+    // Iterate through the path and create each component
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/' || *p == '\\') {
+            char sep = *p;
+            *p = '\0';
+            if (stat(tmp, &st) != 0) {
+                if (mkdir(tmp, 0755) != 0 && errno != EEXIST) {
+                    // Ignore errors for components like "C:" on Windows
+#ifndef _WIN32
+                    *p = sep;
+                    return false;
+#endif
+                }
+            }
+            *p = sep;
+        }
+    }
+
+    return mkdir(tmp, 0755) == 0 || errno == EEXIST;
 }
 
 #ifndef BLOB_TEST
