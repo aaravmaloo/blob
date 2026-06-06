@@ -527,6 +527,10 @@ static bool create_note_file(const AppConfig *cfg, const char *title, char *path
     sanitize_slug(title, slug, sizeof(slug));
     unique_note_path(cfg, slug, path, path_size);
 
+    if (!ensure_dir(cfg->notes_dir)) {
+        return false;
+    }
+
     FILE *file = fopen(path, "w");
     if (!file) {
         return false;
