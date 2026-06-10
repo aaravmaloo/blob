@@ -99,5 +99,4 @@ blob is designed to be:
 - keyboard-driven
 - fast
 - dependency-free
-- simple enough to understand in one source file
 - an inline selector, not a fullscreen TUI
