@@ -2,3 +2,4 @@ lock
 stats
 archive
 git-sync
+pin
