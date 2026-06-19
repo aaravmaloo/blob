@@ -68,6 +68,26 @@
 #define ANSI_SHOW_CURSOR "\x1b[?25h"
 #define ANSI_CLEAR_LINE "\x1b[2K"
 
+typedef struct {
+    char title[16];
+    char selected[16];
+    char search[16];
+    char help[16];
+    char status[16];
+    char timestamp[16];
+    char pagination[16];
+} Theme;
+
+static Theme g_theme = {
+    .title = "\x1b[36m",
+    .selected = "\x1b[32m",
+    .search = "\x1b[33m",
+    .help = "\x1b[2m",
+    .status = "\x1b[31m",
+    .timestamp = "\x1b[90m",
+    .pagination = "\x1b[90m",
+};
+
 void enter_alt_screen(void) {
     printf("\033[?1049h\033[H");
     fflush(stdout);
@@ -551,6 +571,31 @@ static void unique_note_path(const AppConfig *cfg, const char *slug, char *path,
     }
 }
 
+static void unique_path_in_dir(const char *dir, const char *filename, char *path, size_t path_size) {
+    snprintf(path, path_size, "%s" PATH_SEP "%s", dir, filename);
+
+    if (access(path, 0) != 0) {
+        return;
+    }
+
+    char stem[TITLE_MAX];
+    char ext[32] = "";
+    snprintf(stem, sizeof(stem), "%s", filename);
+
+    char *dot = strrchr(stem, '.');
+    if (dot && strlen(dot) < sizeof(ext)) {
+        snprintf(ext, sizeof(ext), "%s", dot);
+        *dot = '\0';
+    }
+
+    for (unsigned int i = 2; i < 10000; i++) {
+        snprintf(path, path_size, "%s" PATH_SEP "%s-%u%s", dir, stem, i, ext);
+        if (access(path, 0) != 0) {
+            return;
+        }
+    }
+}
+
 static bool create_note_file(const AppConfig *cfg, const char *title, char *path, size_t path_size) {
     char slug[TITLE_MAX];
     sanitize_slug(title, slug, sizeof(slug));
@@ -690,6 +735,8 @@ static void render_line(AppState *state, const char *text) {
     state->rendered_lines++;
 }
 
+static void format_relative_time(time_t mtime, char *buf, size_t buf_size);
+
 #ifndef BLOB_TEST
 static void render_ui(AppState *state) {
     normalize_selection(state);
@@ -700,7 +747,7 @@ static void render_ui(AppState *state) {
 
     if (state->search_mode || state->search[0]) {
         char line[SEARCH_MAX + 16];
-        snprintf(line, sizeof(line), "Search: %s", state->search);
+        snprintf(line, sizeof(line), "%sSearch: %s%s", g_theme.search, state->search, ANSI_RESET);
         render_line(state, line);
         render_line(state, "");
     }
@@ -719,36 +766,75 @@ static void render_ui(AppState *state) {
                 continue;
             }
 
-            char line[TITLE_MAX + 16];
-            snprintf(line, sizeof(line), "%s %s",
-                     i == state->selected ? ">" : " ",
-                     state->notes.items[i].title);
+            char time_buf[32];
+            format_relative_time(state->notes.items[i].mtime, time_buf, sizeof(time_buf));
+
+            char line[TITLE_MAX + 64];
+            const char *prefix = i == state->selected ? g_theme.selected : "";
+            snprintf(line, sizeof(line), "%s> %s%-40s%s %s%s%s",
+                     prefix,
+                     g_theme.title,
+                     state->notes.items[i].title,
+                     ANSI_RESET,
+                     g_theme.timestamp,
+                     time_buf,
+                     ANSI_RESET);
             render_line(state, line);
             shown++;
         }
+    }
+
+    if (total_visible > VISIBLE_NOTES) {
+        size_t start = first_rendered_note(state);
+        size_t visible_before_start = 0;
+        for (size_t i = 0; i < start && i < state->notes.count; i++) {
+            if (note_visible(state, i)) visible_before_start++;
+        }
+        size_t end_visible = visible_before_start + shown;
+        char page_info[64];
+        snprintf(page_info, sizeof(page_info), "%sShowing %zu-%zu of %zu%s", g_theme.pagination, visible_before_start + 1, end_visible, total_visible, ANSI_RESET);
+        render_line(state, page_info);
     }
 
     render_line(state, "");
     render_line(state, ANSI_DIM "────────────────────────────────" ANSI_RESET);
     render_line(state, "");
 
+    char help_line[128];
     if (state->search_mode) {
-        render_line(state, ANSI_DIM "[ENTER] open" ANSI_RESET);
-        render_line(state, ANSI_DIM "[ESC] clear search" ANSI_RESET);
-        render_line(state, ANSI_DIM "[q] quit" ANSI_RESET);
+        snprintf(help_line, sizeof(help_line), "%s[ENTER] open%s", g_theme.help, ANSI_RESET);
+        render_line(state, help_line);
+        snprintf(help_line, sizeof(help_line), "%s[ESC] clear search%s", g_theme.help, ANSI_RESET);
+        render_line(state, help_line);
+        snprintf(help_line, sizeof(help_line), "%s[q] quit%s", g_theme.help, ANSI_RESET);
+        render_line(state, help_line);
     } else {
-        render_line(state, ANSI_DIM "[ENTER] open" ANSI_RESET);
-        render_line(state, ANSI_DIM "[n] new" ANSI_RESET);
-        render_line(state, ANSI_DIM "[d] delete" ANSI_RESET);
-        render_line(state, ANSI_DIM "[/] search" ANSI_RESET);
-        render_line(state, ANSI_DIM "[p] plugins" ANSI_RESET);
-        render_line(state, ANSI_DIM "[q] quit" ANSI_RESET);
+        snprintf(help_line, sizeof(help_line), "%s[ENTER] open%s", g_theme.help, ANSI_RESET);
+        render_line(state, help_line);
+        snprintf(help_line, sizeof(help_line), "%s[n] new%s", g_theme.help, ANSI_RESET);
+        render_line(state, help_line);
+        snprintf(help_line, sizeof(help_line), "%s[r] rename%s", g_theme.help, ANSI_RESET);
+        render_line(state, help_line);
+        snprintf(help_line, sizeof(help_line), "%s[d] trash%s", g_theme.help, ANSI_RESET);
+        render_line(state, help_line);
+        snprintf(help_line, sizeof(help_line), "%s[D] delete%s", g_theme.help, ANSI_RESET);
+        render_line(state, help_line);
+        snprintf(help_line, sizeof(help_line), "%s[y] copy path%s", g_theme.help, ANSI_RESET);
+        render_line(state, help_line);
+        snprintf(help_line, sizeof(help_line), "%s[/] search%s", g_theme.help, ANSI_RESET);
+        render_line(state, help_line);
+        snprintf(help_line, sizeof(help_line), "%s[:] command%s", g_theme.help, ANSI_RESET);
+        render_line(state, help_line);
+        snprintf(help_line, sizeof(help_line), "%s[p] plugins%s", g_theme.help, ANSI_RESET);
+        render_line(state, help_line);
+        snprintf(help_line, sizeof(help_line), "%s[q] quit%s", g_theme.help, ANSI_RESET);
+        render_line(state, help_line);
     }
 
     if (state->status[0]) {
         render_line(state, "");
         char status_line[INPUT_MAX + 16];
-        snprintf(status_line, sizeof(status_line), ANSI_RED "%s" ANSI_RESET, state->status);
+        snprintf(status_line, sizeof(status_line), "%s%s%s", g_theme.status, state->status, ANSI_RESET);
         render_line(state, status_line);
         state->status[0] = '\0';
     }
@@ -940,6 +1026,40 @@ static void create_note_flow(AppState *state, const AppConfig *cfg) {
 }
 
 static void delete_note_flow(AppState *state, const AppConfig *cfg) {
+    if (state->notes.count == 0 || !selected_is_visible(state)) {
+        return;
+    }
+
+    Note selected = state->notes.items[state->selected];
+    char message[TITLE_MAX + 32];
+    snprintf(message, sizeof(message), "Move \"%s\" to trash?", selected.title);
+
+    if (!prompt_confirm(state, message)) {
+        return;
+    }
+
+    char trash_dir[PATH_MAX];
+    snprintf(trash_dir, sizeof(trash_dir), "%s" PATH_SEP ".trash", cfg->notes_dir);
+    if (!ensure_dir(trash_dir)) {
+        snprintf(state->status, sizeof(state->status), "failed to create trash");
+        return;
+    }
+
+    char trash_path[PATH_MAX];
+    unique_path_in_dir(trash_dir, selected.filename, trash_path, sizeof(trash_path));
+
+    size_t previous = state->selected;
+    if (rename(selected.path, trash_path) != 0) {
+        snprintf(state->status, sizeof(state->status), "failed to trash note: %s", strerror(errno));
+        return;
+    }
+
+    load_notes(&state->notes, cfg);
+    state->selected = previous;
+    normalize_selection(state);
+}
+
+static void hard_delete_note_flow(AppState *state, const AppConfig *cfg) {
     (void)cfg;
 
     if (state->notes.count == 0 || !selected_is_visible(state)) {
@@ -947,8 +1067,8 @@ static void delete_note_flow(AppState *state, const AppConfig *cfg) {
     }
 
     Note selected = state->notes.items[state->selected];
-    char message[TITLE_MAX + 32];
-    snprintf(message, sizeof(message), "Delete \"%s\"?", selected.title);
+    char message[TITLE_MAX + 64];
+    snprintf(message, sizeof(message), "Permanently delete \"%s\"?", selected.title);
 
     if (!prompt_confirm(state, message)) {
         return;
@@ -963,6 +1083,167 @@ static void delete_note_flow(AppState *state, const AppConfig *cfg) {
     load_notes(&state->notes, cfg);
     state->selected = previous;
     normalize_selection(state);
+}
+
+static void restore_note_flow(AppState *state, const AppConfig *cfg) {
+    char trash_dir[PATH_MAX];
+    snprintf(trash_dir, sizeof(trash_dir), "%s" PATH_SEP ".trash", cfg->notes_dir);
+
+    char query[INPUT_MAX];
+    query[0] = '\0';
+    if (!prompt_text(state, "Restore note contains", query, sizeof(query))) {
+        return;
+    }
+
+#ifdef _WIN32
+    char pattern[PATH_MAX];
+    snprintf(pattern, sizeof(pattern), "%s" PATH_SEP "*.md", trash_dir);
+    WIN32_FIND_DATAA data;
+    HANDLE find = FindFirstFileA(pattern, &data);
+    if (find == INVALID_HANDLE_VALUE) {
+        snprintf(state->status, sizeof(state->status), "trash is empty");
+        return;
+    }
+
+    do {
+        if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        char title[TITLE_MAX];
+        title_from_filename(title, sizeof(title), data.cFileName);
+        if (!contains_case_insensitive(title, query) && !contains_case_insensitive(data.cFileName, query)) continue;
+
+        char src[PATH_MAX];
+        char dst[PATH_MAX];
+        snprintf(src, sizeof(src), "%s" PATH_SEP "%s", trash_dir, data.cFileName);
+        unique_path_in_dir(cfg->notes_dir, data.cFileName, dst, sizeof(dst));
+        FindClose(find);
+        if (rename(src, dst) != 0) {
+            snprintf(state->status, sizeof(state->status), "failed to restore note: %s", strerror(errno));
+        } else {
+            snprintf(state->status, sizeof(state->status), "restored %s", data.cFileName);
+            load_notes(&state->notes, cfg);
+            normalize_selection(state);
+        }
+        return;
+    } while (FindNextFileA(find, &data));
+    FindClose(find);
+#else
+    DIR *dir = opendir(trash_dir);
+    if (!dir) {
+        snprintf(state->status, sizeof(state->status), "trash is empty");
+        return;
+    }
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (!has_md_extension(entry->d_name)) continue;
+        char title[TITLE_MAX];
+        title_from_filename(title, sizeof(title), entry->d_name);
+        if (!contains_case_insensitive(title, query) && !contains_case_insensitive(entry->d_name, query)) continue;
+
+        char filename[TITLE_MAX];
+        snprintf(filename, sizeof(filename), "%s", entry->d_name);
+        char src[PATH_MAX];
+        char dst[PATH_MAX];
+        snprintf(src, sizeof(src), "%s" PATH_SEP "%s", trash_dir, filename);
+        unique_path_in_dir(cfg->notes_dir, filename, dst, sizeof(dst));
+        closedir(dir);
+        if (rename(src, dst) != 0) {
+            snprintf(state->status, sizeof(state->status), "failed to restore note: %s", strerror(errno));
+        } else {
+            snprintf(state->status, sizeof(state->status), "restored %s", filename);
+            load_notes(&state->notes, cfg);
+            normalize_selection(state);
+        }
+        return;
+    }
+    closedir(dir);
+#endif
+
+    snprintf(state->status, sizeof(state->status), "no trash match");
+}
+
+static void rename_note_flow(AppState *state, const AppConfig *cfg) {
+    if (state->notes.count == 0 || !selected_is_visible(state)) {
+        return;
+    }
+
+    Note selected = state->notes.items[state->selected];
+    char new_title[INPUT_MAX];
+    snprintf(new_title, sizeof(new_title), "%s", selected.title);
+
+    if (!prompt_text(state, "New title", new_title, sizeof(new_title))) {
+        return;
+    }
+
+    char new_path[PATH_MAX];
+    char slug[TITLE_MAX];
+    sanitize_slug(new_title, slug, sizeof(slug));
+    unique_note_path(cfg, slug, new_path, sizeof(new_path));
+
+    if (rename(selected.path, new_path) != 0) {
+        snprintf(state->status, sizeof(state->status), "failed to rename note: %s", strerror(errno));
+        return;
+    }
+
+    load_notes(&state->notes, cfg);
+    normalize_selection(state);
+}
+
+static void copy_path_to_clipboard(AppState *state, const AppConfig *cfg) {
+    (void)cfg;
+    if (state->notes.count == 0 || !selected_is_visible(state)) {
+        return;
+    }
+
+    Note selected = state->notes.items[state->selected];
+
+#ifdef _WIN32
+    clear_owned_region(state);
+    disable_raw_mode();
+
+    if (OpenClipboard(NULL)) {
+        EmptyClipboard();
+        HGLOBAL hGlob = GlobalAlloc(GMEM_MOVEABLE, strlen(selected.path) + 1);
+        if (hGlob) {
+            char *pGlob = GlobalLock(hGlob);
+            strcpy(pGlob, selected.path);
+            GlobalUnlock(hGlob);
+            SetClipboardData(CF_TEXT, hGlob);
+        }
+        CloseClipboard();
+        snprintf(state->status, sizeof(state->status), "Copied path to clipboard");
+    } else {
+        snprintf(state->status, sizeof(state->status), "Failed to open clipboard");
+    }
+
+    enable_raw_mode();
+#else
+    char cmd[PATH_MAX + 64];
+    snprintf(cmd, sizeof(cmd), "printf '%s' | xclip -selection clipboard 2>/dev/null || printf '%s' | xsel -b 2>/dev/null || printf '%s' | pbcopy 2>/dev/null", selected.path, selected.path, selected.path);
+    if (system(cmd) == 0) {
+        snprintf(state->status, sizeof(state->status), "Copied path to clipboard");
+    } else {
+        snprintf(state->status, sizeof(state->status), "Clipboard unavailable (need xclip/xsel/pbcopy)");
+    }
+#endif
+}
+
+static void format_relative_time(time_t mtime, char *buf, size_t buf_size) {
+    time_t now = time(NULL);
+    long diff = (long)(now - mtime);
+
+    if (diff < 60) {
+        snprintf(buf, buf_size, "%lds ago", diff);
+    } else if (diff < 3600) {
+        snprintf(buf, buf_size, "%ldm ago", diff / 60);
+    } else if (diff < 86400) {
+        snprintf(buf, buf_size, "%ldh ago", diff / 3600);
+    } else if (diff < 604800) {
+        snprintf(buf, buf_size, "%ldd ago", diff / 86400);
+    } else {
+        struct tm *tm = localtime(&mtime);
+        strftime(buf, buf_size, "%b %d", tm);
+    }
 }
 
 
@@ -995,18 +1276,27 @@ static void handle_search_key(AppState *state, KeyEvent key) {
 #define PLUGIN_NAME_MAX 64
 #define PLUGIN_DESC_MAX 256
 #define PLUGIN_AUTH_MAX 128
+#define PLUGIN_VERSION_MAX 32
+#define PLUGIN_MODE_MAX 16
+#define PLUGIN_PERMS_MAX 256
 
 typedef struct {
     char name[PLUGIN_NAME_MAX];
     char authors[PLUGIN_AUTH_MAX];
     char description[PLUGIN_DESC_MAX];
+    char version[PLUGIN_VERSION_MAX];
+    char mode[PLUGIN_MODE_MAX];
+    char permissions[PLUGIN_PERMS_MAX];
     char keybind;
+    int api;
     char dir_path[PATH_MAX];
     char c_path[PATH_MAX];
     char exe_path[PATH_MAX];
     bool is_compiled;
     bool is_remote;
     bool is_disabled;
+    bool has_keybind_conflict;
+    bool is_legacy;
     bool update_available;
     bool exists_on_remote;
 } Plugin;
@@ -1118,6 +1408,33 @@ static void set_plugin_disabled_on_disk(const AppConfig *cfg, const char *name, 
     }
 }
 
+static bool key_is_core_reserved(char key) {
+    const char *reserved = "nrdDy/p:q";
+    return key && (strchr(reserved, key) != NULL || key == '\r' || key == '\n');
+}
+
+static bool plugin_uses_workspace(const Plugin *plugin) {
+    return strcmp(plugin->mode, "workspace") == 0;
+}
+
+static bool parse_manifest_string(const char *line, const char *key, char *dst, size_t dst_size) {
+    if (strstr(line, key) == NULL) {
+        return false;
+    }
+
+    char *p = strchr(line, '=');
+    if (!p) {
+        return false;
+    }
+    p++;
+    while (*p && (*p == ' ' || *p == '<' || *p == '{' || *p == '"' || *p == '\'' || *p == '[')) p++;
+    char *end = p + strlen(p);
+    while (end > p && (end[-1] == ' ' || end[-1] == '>' || end[-1] == '}' || end[-1] == '"' || end[-1] == '\'' || end[-1] == ']')) end--;
+    *end = '\0';
+    snprintf(dst, dst_size, "%s", p);
+    return true;
+}
+
 static bool parse_plugin_readme(const char *readme_path, Plugin *plugin) {
     FILE *f = fopen(readme_path, "r");
     if (!f) return false;
@@ -1126,6 +1443,11 @@ static bool parse_plugin_readme(const char *readme_path, Plugin *plugin) {
     plugin->name[0] = '\0';
     plugin->authors[0] = '\0';
     plugin->description[0] = '\0';
+    plugin->version[0] = '\0';
+    plugin->permissions[0] = '\0';
+    snprintf(plugin->mode, sizeof(plugin->mode), "note");
+    plugin->api = 1;
+    plugin->is_legacy = true;
     plugin->keybind = '\0';
 
     while (fgets(line, sizeof(line), f)) {
@@ -1139,24 +1461,20 @@ static bool parse_plugin_readme(const char *readme_path, Plugin *plugin) {
             while (*name && isspace((unsigned char)*name)) name++;
             snprintf(plugin->name, sizeof(plugin->name), "%s", name);
         } else if (strstr(line, "[authors] =") != NULL) {
-            char *p = strchr(line, '=');
-            if (p) {
-                p++;
-                while (*p && (*p == ' ' || *p == '{' || *p == '"' || *p == '\'' || *p == '[')) p++;
-                char *end = p + strlen(p);
-                while (end > p && (end[-1] == ' ' || end[-1] == '}' || end[-1] == '"' || end[-1] == '\'' || end[-1] == ']')) end--;
-                *end = '\0';
-                snprintf(plugin->authors, sizeof(plugin->authors), "%s", p);
-            }
+            parse_manifest_string(line, "[authors] =", plugin->authors, sizeof(plugin->authors));
         } else if (strstr(line, "[description] =") != NULL) {
+            parse_manifest_string(line, "[description] =", plugin->description, sizeof(plugin->description));
+        } else if (strstr(line, "[version] =") != NULL) {
+            parse_manifest_string(line, "[version] =", plugin->version, sizeof(plugin->version));
+        } else if (strstr(line, "[mode] =") != NULL) {
+            parse_manifest_string(line, "[mode] =", plugin->mode, sizeof(plugin->mode));
+        } else if (strstr(line, "[permissions] =") != NULL) {
+            parse_manifest_string(line, "[permissions] =", plugin->permissions, sizeof(plugin->permissions));
+        } else if (strstr(line, "[api] =") != NULL) {
             char *p = strchr(line, '=');
             if (p) {
-                p++;
-                while (*p && (*p == ' ' || *p == '<' || *p == '"' || *p == '\'')) p++;
-                char *end = p + strlen(p);
-                while (end > p && (end[-1] == ' ' || end[-1] == '>' || end[-1] == '"' || end[-1] == '\'')) end--;
-                *end = '\0';
-                snprintf(plugin->description, sizeof(plugin->description), "%s", p);
+                plugin->api = atoi(p + 1);
+                plugin->is_legacy = false;
             }
         } else if (strstr(line, "[keybind] =") != NULL) {
             char *p = strchr(line, '=');
@@ -1170,6 +1488,7 @@ static bool parse_plugin_readme(const char *readme_path, Plugin *plugin) {
         }
     }
     fclose(f);
+    plugin->has_keybind_conflict = key_is_core_reserved(plugin->keybind);
     return plugin->name[0] != '\0';
 }
 
@@ -1272,6 +1591,22 @@ static void scan_addons_dir(PluginList *list, const AppConfig *cfg, const char *
     }
     closedir(dir);
 #endif
+}
+
+static void mark_plugin_keybind_conflicts(PluginList *list) {
+    for (size_t i = 0; i < list->count; i++) {
+        list->items[i].has_keybind_conflict = key_is_core_reserved(list->items[i].keybind);
+    }
+
+    for (size_t i = 0; i < list->count; i++) {
+        for (size_t j = i + 1; j < list->count; j++) {
+            if (list->items[i].keybind &&
+                list->items[i].keybind == list->items[j].keybind) {
+                list->items[i].has_keybind_conflict = true;
+                list->items[j].has_keybind_conflict = true;
+            }
+        }
+    }
 }
 
 static bool files_are_different(const char *path1, const char *path2) {
@@ -1411,7 +1746,32 @@ static bool copy_file(const char *src, const char *dst) {
     return true;
 }
 
+static bool confirm_plugin_action(AppState *state, const Plugin *plugin, const char *action) {
+    if (plugin->api > 2) {
+        snprintf(state->status, sizeof(state->status), "Plugin %s needs newer blob API.", plugin->name);
+        return false;
+    }
+
+    char message[INPUT_MAX];
+    snprintf(message, sizeof(message), "%s %s api=%d mode=%s perms=%s%s?",
+             action,
+             plugin->name,
+             plugin->api,
+             plugin->mode[0] ? plugin->mode : "note",
+             plugin->permissions[0] ? plugin->permissions : "unknown",
+             plugin->is_legacy ? " legacy" : "");
+    return prompt_confirm(state, message);
+}
+
 static bool compile_plugin(AppState *state, const AppConfig *cfg, Plugin *plugin) {
+    if (plugin->has_keybind_conflict) {
+        snprintf(state->status, sizeof(state->status), "Plugin %s keybind conflicts.", plugin->name);
+        return false;
+    }
+    if (!confirm_plugin_action(state, plugin, plugin->is_compiled ? "Update" : "Install")) {
+        return false;
+    }
+
     clear_owned_region(state);
     disable_raw_mode();
     enter_alt_screen();
@@ -1546,10 +1906,10 @@ static void delete_plugin(AppState *state, const AppConfig *cfg, PluginList *lis
     plugin->update_available = false;
 }
 
-static bool run_plugin_process(const char *exe_path, const char *note_path) {
+static bool run_plugin_process(const char *exe_path, const char *target_path) {
 #ifdef _WIN32
     char command[PATH_MAX * 2 + 16];
-    snprintf(command, sizeof(command), "\"%s\" \"%s\"", exe_path, note_path);
+    snprintf(command, sizeof(command), "\"%s\" \"%s\"", exe_path, target_path);
 
     STARTUPINFOA si;
     PROCESS_INFORMATION pi;
@@ -1567,7 +1927,7 @@ if (ok) {
 #else
     pid_t pid = fork();
     if (pid == 0) {
-        char *argv[] = {(char *)exe_path, (char *)note_path, NULL};
+        char *argv[] = {(char *)exe_path, (char *)target_path, NULL};
         execvp(exe_path, argv);
         _exit(127);
     } else if (pid > 0) {
@@ -1580,7 +1940,15 @@ if (ok) {
 #endif
 }
 
-static void run_plugin_on_note(AppState *state, const Plugin *plugin, const char *note_path) {
+static void run_plugin_on_target(AppState *state, const Plugin *plugin, const char *target_path, bool ask) {
+    if (plugin->has_keybind_conflict) {
+        snprintf(state->status, sizeof(state->status), "Plugin %s keybind conflicts.", plugin->name);
+        return;
+    }
+    if (ask && !confirm_plugin_action(state, plugin, "Run")) {
+        return;
+    }
+
     clear_owned_region(state);
     disable_raw_mode();
     enter_alt_screen();
@@ -1588,7 +1956,7 @@ static void run_plugin_on_note(AppState *state, const Plugin *plugin, const char
     printf("Executing plugin: %s...\n", plugin->name);
     fflush(stdout);
 
-    if (!run_plugin_process(plugin->exe_path, note_path)) {
+    if (!run_plugin_process(plugin->exe_path, target_path)) {
         printf("\nPlugin execution failed.\nPress any key to continue...");
         fflush(stdout);
         read_key();
@@ -1597,6 +1965,14 @@ static void run_plugin_on_note(AppState *state, const Plugin *plugin, const char
     exit_alt_screen();
     enable_raw_mode();
     state->rendered_lines = 0;
+}
+
+static void run_plugin_on_note(AppState *state, const Plugin *plugin, const char *note_path) {
+    run_plugin_on_target(state, plugin, note_path, true);
+}
+
+static void run_plugin_for_workspace(AppState *state, const Plugin *plugin, const AppConfig *cfg) {
+    run_plugin_on_target(state, plugin, cfg->notes_dir, true);
 }
 
 static void render_plugin_ui(AppState *state, PluginList *plugins, size_t selected_plugin) {
@@ -1609,12 +1985,16 @@ static void render_plugin_ui(AppState *state, PluginList *plugins, size_t select
     if (plugins->count == 0) {
         render_line(state, ANSI_DIM "no plugins found" ANSI_RESET);
     } else {
+        char line[256];
         for (size_t i = 0; i < plugins->count; i++) {
             Plugin *p = &plugins->items[i];
-            char line[256];
             char status[32] = "";
             if (p->is_disabled) {
                 snprintf(status, sizeof(status), "[disabled]");
+            } else if (p->has_keybind_conflict) {
+                snprintf(status, sizeof(status), "[key conflict]");
+            } else if (p->api > 2) {
+                snprintf(status, sizeof(status), "[newer api]");
             } else if (p->is_compiled) {
                 if (p->update_available) {
                     snprintf(status, sizeof(status), "[update available]");
@@ -1627,9 +2007,8 @@ static void render_plugin_ui(AppState *state, PluginList *plugins, size_t select
                 snprintf(status, sizeof(status), "[not compiled]");
             }
 
-            snprintf(line, sizeof(line), "%s %-15s %s",
-                     i == selected_plugin ? ">" : " ",
-                     p->name, status);
+            const char *prefix = i == selected_plugin ? g_theme.selected : "";
+            snprintf(line, sizeof(line), "%s> %-15s %s%s", prefix, p->name, status, ANSI_RESET);
             render_line(state, line);
         }
     }
@@ -1641,20 +2020,30 @@ static void render_plugin_ui(AppState *state, PluginList *plugins, size_t select
     if (plugins->count > 0 && selected_plugin < plugins->count) {
         Plugin *p = &plugins->items[selected_plugin];
         char line[512];
-        snprintf(line, sizeof(line), "Author:      %s", p->authors[0] ? p->authors : "Unknown");
+        snprintf(line, sizeof(line), "%sAuthor:%s      %s", g_theme.title, ANSI_RESET, p->authors[0] ? p->authors : "Unknown");
         render_line(state, line);
-        snprintf(line, sizeof(line), "Description: %s", p->description[0] ? p->description : "None");
+        snprintf(line, sizeof(line), "%sDescription:%s %s", g_theme.title, ANSI_RESET, p->description[0] ? p->description : "None");
         render_line(state, line);
-        snprintf(line, sizeof(line), "Keybind:     %c", p->keybind ? p->keybind : ' ');
+        snprintf(line, sizeof(line), "%sKeybind:%s     %c", g_theme.title, ANSI_RESET, p->keybind ? p->keybind : ' ');
+        render_line(state, line);
+        snprintf(line, sizeof(line), "%sAPI/Mode:%s    %d / %s%s", g_theme.title, ANSI_RESET, p->api, p->mode[0] ? p->mode : "note", p->is_legacy ? " (legacy)" : "");
+        render_line(state, line);
+        snprintf(line, sizeof(line), "%sPerms:%s       %s", g_theme.title, ANSI_RESET, p->permissions[0] ? p->permissions : "unknown");
         render_line(state, line);
         render_line(state, "");
     }
 
-    render_line(state, ANSI_DIM "[ENTER] install/compile/update" ANSI_RESET);
-    render_line(state, ANSI_DIM "[u] uninstall (delete binary)" ANSI_RESET);
-    render_line(state, ANSI_DIM "[t] toggle enable/disable" ANSI_RESET);
-    render_line(state, ANSI_DIM "[Ctrl+P] disable plugin system" ANSI_RESET);
-    render_line(state, ANSI_DIM "[ESC/q] back to notes" ANSI_RESET);
+    char help_line[128];
+    snprintf(help_line, sizeof(help_line), "%s[ENTER] install/compile/update%s", g_theme.help, ANSI_RESET);
+    render_line(state, help_line);
+    snprintf(help_line, sizeof(help_line), "%s[u] uninstall (delete binary)%s", g_theme.help, ANSI_RESET);
+    render_line(state, help_line);
+    snprintf(help_line, sizeof(help_line), "%s[t] toggle enable/disable%s", g_theme.help, ANSI_RESET);
+    render_line(state, help_line);
+    snprintf(help_line, sizeof(help_line), "%s[Ctrl+P] disable plugin system%s", g_theme.help, ANSI_RESET);
+    render_line(state, help_line);
+    snprintf(help_line, sizeof(help_line), "%s[ESC/q] back to notes%s", g_theme.help, ANSI_RESET);
+    render_line(state, help_line);
 
     if (state->status[0]) {
         render_line(state, "");
@@ -1672,6 +2061,7 @@ static void plugin_manager_flow(AppState *state, const AppConfig *cfg) {
 
     scan_addons_dir(&plugins, cfg, cfg->addons_dir);
     scan_addons_dir(&plugins, cfg, "addons");
+    mark_plugin_keybind_conflicts(&plugins);
 
     bool check_remote = false;
     if (is_plugin_system_enabled(cfg)) {
@@ -1688,6 +2078,7 @@ static void plugin_manager_flow(AppState *state, const AppConfig *cfg) {
 
     if (check_remote) {
         fetch_remote_plugins(state, cfg, &plugins);
+        mark_plugin_keybind_conflicts(&plugins);
     }
 
     size_t selected = 0;
@@ -1823,6 +2214,71 @@ static void open_selected_note(AppState *state, const AppConfig *cfg) {
     normalize_selection(state);
 }
 
+static void lower_ascii(char *s) {
+    for (; *s; s++) {
+        *s = (char)tolower((unsigned char)*s);
+    }
+}
+
+static bool run_named_plugin(AppState *state, const AppConfig *cfg, const char *name) {
+    PluginList plugins = {NULL, 0, 0};
+    scan_addons_dir(&plugins, cfg, cfg->addons_dir);
+    scan_addons_dir(&plugins, cfg, "addons");
+    mark_plugin_keybind_conflicts(&plugins);
+
+    for (size_t i = 0; i < plugins.count; i++) {
+        Plugin *p = &plugins.items[i];
+        if (contains_case_insensitive(p->name, name) && p->is_compiled && !p->is_disabled) {
+            if (plugin_uses_workspace(p)) {
+                run_plugin_for_workspace(state, p, cfg);
+            } else if (state->notes.count > 0 && selected_is_visible(state)) {
+                run_plugin_on_note(state, p, state->notes.items[state->selected].path);
+            } else {
+                snprintf(state->status, sizeof(state->status), "no selected note");
+            }
+            plugin_list_free(&plugins);
+            load_notes(&state->notes, cfg);
+            normalize_selection(state);
+            return true;
+        }
+    }
+
+    plugin_list_free(&plugins);
+    return false;
+}
+
+static void command_palette_flow(AppState *state, const AppConfig *cfg) {
+    char command[INPUT_MAX];
+    command[0] = '\0';
+    if (!prompt_text(state, "Command", command, sizeof(command))) {
+        return;
+    }
+
+    lower_ascii(command);
+
+    if (strcmp(command, "new") == 0 || strcmp(command, "n") == 0) {
+        create_note_flow(state, cfg);
+    } else if (strcmp(command, "open") == 0 || strcmp(command, "edit") == 0) {
+        open_selected_note(state, cfg);
+    } else if (strcmp(command, "rename") == 0 || strcmp(command, "r") == 0) {
+        rename_note_flow(state, cfg);
+    } else if (strcmp(command, "trash") == 0 || strcmp(command, "delete") == 0 || strcmp(command, "d") == 0) {
+        delete_note_flow(state, cfg);
+    } else if (strcmp(command, "hard delete") == 0 || strcmp(command, "purge") == 0) {
+        hard_delete_note_flow(state, cfg);
+    } else if (strcmp(command, "restore") == 0) {
+        restore_note_flow(state, cfg);
+    } else if (strcmp(command, "copy path") == 0 || strcmp(command, "copy") == 0) {
+        copy_path_to_clipboard(state, cfg);
+    } else if (strcmp(command, "plugins") == 0 || strcmp(command, "plugin") == 0) {
+        plugin_manager_flow(state, cfg);
+    } else if (strcmp(command, "quit") == 0 || strcmp(command, "q") == 0) {
+        state->running = false;
+    } else if (!run_named_plugin(state, cfg, command)) {
+        snprintf(state->status, sizeof(state->status), "unknown command: %s", command);
+    }
+}
+
 #ifndef BLOB_TEST
 static void handle_key(AppState *state, const AppConfig *cfg, KeyEvent key) {
     if (key.type == KEY_UP) {
@@ -1858,8 +2314,17 @@ static void handle_key(AppState *state, const AppConfig *cfg, KeyEvent key) {
     case 'n':
         create_note_flow(state, cfg);
         break;
+    case 'r':
+        rename_note_flow(state, cfg);
+        break;
     case 'd':
         delete_note_flow(state, cfg);
+        break;
+    case 'D':
+        hard_delete_note_flow(state, cfg);
+        break;
+    case 'y':
+        copy_path_to_clipboard(state, cfg);
         break;
     case '/':
         state->search_mode = true;
@@ -1869,16 +2334,24 @@ static void handle_key(AppState *state, const AppConfig *cfg, KeyEvent key) {
     case 'p':
         plugin_manager_flow(state, cfg);
         break;
+    case ':':
+        command_palette_flow(state, cfg);
+        break;
     default:
         if (is_plugin_system_enabled(cfg) && state->notes.count > 0 && selected_is_visible(state)) {
             PluginList temp_plugins = {NULL, 0, 0};
             scan_addons_dir(&temp_plugins, cfg, cfg->addons_dir);
             scan_addons_dir(&temp_plugins, cfg, "addons");
+            mark_plugin_keybind_conflicts(&temp_plugins);
 
             for (size_t i = 0; i < temp_plugins.count; i++) {
                 Plugin *p = &temp_plugins.items[i];
-                if (p->is_compiled && !p->is_disabled && p->keybind == key.ch) {
-                    run_plugin_on_note(state, p, state->notes.items[state->selected].path);
+                if (p->is_compiled && !p->is_disabled && !p->has_keybind_conflict && p->keybind == key.ch) {
+                    if (plugin_uses_workspace(p)) {
+                        run_plugin_for_workspace(state, p, cfg);
+                    } else {
+                        run_plugin_on_note(state, p, state->notes.items[state->selected].path);
+                    }
                     plugin_list_free(&temp_plugins);
                     load_notes(&state->notes, cfg);
                     normalize_selection(state);
