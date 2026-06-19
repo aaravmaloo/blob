@@ -3,3 +3,5 @@ stats
 archive
 git-sync
 pin
+fuzzy-search
+tags
