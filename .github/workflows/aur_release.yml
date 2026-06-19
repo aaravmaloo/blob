@@ -4,6 +4,7 @@ on:
   workflow_run:
     workflows:
       - release
+      - release.yml
     types:
       - completed
   workflow_dispatch:
@@ -22,7 +23,7 @@ jobs:
       - name: install tools
         shell: bash
         run: |
-          pacman -Sy --noconfirm --needed base-devel curl git openssh
+          pacman -Sy --noconfirm --needed base-devel curl git jq openssh
 
       - name: configure ssh
         shell: bash
@@ -60,13 +61,23 @@ jobs:
         shell: bash
         env:
           DISPATCH_VERSION: ${{ github.event.inputs.version }}
-          RELEASE_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
-          VERSION="${DISPATCH_VERSION:-$RELEASE_BRANCH}"
+          VERSION="$DISPATCH_VERSION"
+
+          if [ -z "$VERSION" ]; then
+            VERSION=$(curl -fsSL \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/latest" \
+              | jq -r '.tag_name')
+          fi
+
           VERSION="${VERSION#refs/tags/}"
 
           if [ -z "$VERSION" ] || [[ "$VERSION" != v* ]]; then
-            echo "Could not resolve release tag from workflow event."
+            echo "Could not resolve release tag."
             echo "Use manual workflow_dispatch with version=vX.Y.Z."
             exit 1
           fi
