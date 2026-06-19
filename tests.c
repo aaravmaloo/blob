@@ -91,9 +91,88 @@ static void test_parse_plugin_readme(void) {
     assert(strcmp(p.authors, "Alice\", \"Bob") == 0); // Note: current parser logic for authors is basic
     assert(strcmp(p.description, "A plugin for testing purposes.") == 0);
     assert(p.keybind == 't');
+    assert(p.api == 1);
+    assert(p.is_legacy);
+    assert(strcmp(p.mode, "note") == 0);
 
     remove(test_readme);
     printf("test_parse_plugin_readme passed\n");
+}
+
+static void test_parse_plugin_readme_api2(void) {
+    const char *test_readme = "test_readme_api2.md";
+    FILE *f = fopen(test_readme, "w");
+    assert(f != NULL);
+    fprintf(f, "# workspace\n\n");
+    fprintf(f, "[api] = 2\n");
+    fprintf(f, "[version] = 1.2.3\n");
+    fprintf(f, "[authors] = {\"Alice\"}\n");
+    fprintf(f, "[description] = <Workspace plugin.>\n");
+    fprintf(f, "[keybind] = f\n");
+    fprintf(f, "[mode] = workspace\n");
+    fprintf(f, "[permissions] = {\"read-notes\",\"network\"}\n");
+    fclose(f);
+
+    Plugin p;
+    memset(&p, 0, sizeof(p));
+    assert(parse_plugin_readme(test_readme, &p));
+
+    assert(strcmp(p.name, "workspace") == 0);
+    assert(p.api == 2);
+    assert(!p.is_legacy);
+    assert(strcmp(p.version, "1.2.3") == 0);
+    assert(strcmp(p.mode, "workspace") == 0);
+    assert(strcmp(p.permissions, "read-notes\",\"network") == 0);
+    assert(plugin_uses_workspace(&p));
+    assert(!p.has_keybind_conflict);
+
+    remove(test_readme);
+    printf("test_parse_plugin_readme_api2 passed\n");
+}
+
+static void test_plugin_keybind_conflicts(void) {
+    assert(key_is_core_reserved('p'));
+    assert(key_is_core_reserved(':'));
+    assert(!key_is_core_reserved('f'));
+
+    PluginList list = {NULL, 0, 0};
+    Plugin a, b, c;
+    memset(&a, 0, sizeof(a));
+    memset(&b, 0, sizeof(b));
+    memset(&c, 0, sizeof(c));
+    strcpy(a.name, "a");
+    strcpy(b.name, "b");
+    strcpy(c.name, "c");
+    a.keybind = 'x';
+    b.keybind = 'x';
+    c.keybind = 'p';
+
+    assert(plugin_list_push(&list, &a));
+    assert(plugin_list_push(&list, &b));
+    assert(plugin_list_push(&list, &c));
+    mark_plugin_keybind_conflicts(&list);
+
+    assert(list.items[0].has_keybind_conflict);
+    assert(list.items[1].has_keybind_conflict);
+    assert(list.items[2].has_keybind_conflict);
+
+    plugin_list_free(&list);
+    printf("test_plugin_keybind_conflicts passed\n");
+}
+
+static void test_unique_path_in_dir(void) {
+    const char *existing = "collision.md";
+    FILE *f = fopen(existing, "w");
+    assert(f != NULL);
+    fprintf(f, "hello");
+    fclose(f);
+
+    char path[PATH_MAX];
+    unique_path_in_dir(".", existing, path, sizeof(path));
+    assert(strstr(path, "collision-2.md") != NULL);
+
+    remove(existing);
+    printf("test_unique_path_in_dir passed\n");
 }
 
 static void test_files_are_different(void) {
@@ -128,6 +207,9 @@ int main(void) {
     test_contains_case_insensitive();
     test_note_cmp();
     test_parse_plugin_readme();
+    test_parse_plugin_readme_api2();
+    test_plugin_keybind_conflicts();
+    test_unique_path_in_dir();
     test_files_are_different();
 
     printf("\nAll tests passed!\n");
