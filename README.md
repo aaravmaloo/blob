@@ -18,7 +18,10 @@
 - inline interactive note selector
 - markdown note creation
 - live note search
-- note deletion
+- rename, trash, restore, and hard delete flows
+- command palette for core actions and installed plugins
+- relative timestamps and pagination
+- safer plugin installs with API, mode, and permission metadata
 - customizability
 
 ## Customizing blob
@@ -65,8 +68,12 @@ make release
 | `↑/↓` | Navigate notes |
 | `Enter` | Open note |
 | `n` | Create note |
-| `d` | Delete note |
+| `r` | Rename note |
+| `d` | Move note to trash |
+| `D` | Permanently delete note |
+| `y` | Copy note path |
 | `/` | Search notes |
+| `:` | Open command palette |
 | `p` | Open plugins manager |
 | `Esc` | Clear search |
 | `q` | Quit |
@@ -74,6 +81,8 @@ make release
 ## Plugins
 
 blob supports optional, compiled plugins to extend its features (like encryption or sync) without bloating the core. Press `p` inside the interface to manage plugins. For every step/access blob does, it requires your permission for maximum safety.
+
+Plugins declare an API version, run mode, and permissions in their README manifest. blob warns about legacy plugins, keybind conflicts, and plugins that require a newer API.
 
 If you are a developer and want to create your own plugin, see [PLUGIN_DEVELOPMENT.md](file:///C:/Users/Aarav%20Maloo/Desktop/blob/PLUGIN_DEVELOPMENT.md).
 
