@@ -1,109 +1,162 @@
 # `blob` plugin development
-`blob` supports a simple, compiled plugin architecture. Addons are standalone executables compiled on-device. They interact with `blob` via file path arguments and standard terminal IO, keeping `blob` lightweight, secure, and extensible.
+
+`blob` supports small compiled plugins. Plugins are standalone executables that receive either a selected note path or the notes directory as `argv[1]`.
 
 ---
 
 ## 1. Directory Structure
 
-A plugin must reside in a dedicated folder under the `addons/` directory. `blob` scans for plugins in two locations:
-1. System data directory (e.g. `%LOCALAPPDATA%\blob\addons` or `~/.local/share/blob/addons`)
-2. Local workspace directory (`./addons/` relative to where `blob` is run)
+A plugin must live in its own folder under `addons/`:
 
-The folder structure must look like this:
 ```text
 addons/
-└── my_plugin/              <-- Must match plugin name
-    ├── my_plugin.c         <-- Source file
-    └── README.md           <-- Documentation & manifest
+└── my_plugin/
+    ├── my_plugin.c
+    └── README.md
 ```
 
-On compilation, `blob` compiles `my_plugin.c` directly into a native executable in the same directory:
-* **POSIX**: `addons/my_plugin/my_plugin`
-* **Windows**: `addons/my_plugin\my_plugin.exe`
+The folder name and C file name should match the plugin name.
+
+On compile:
+
+```text
+POSIX:   addons/my_plugin/my_plugin
+Windows: addons/my_plugin/my_plugin.exe
+```
 
 ---
 
-## 2. Plugin Manifest (`README.md`)
+## 2. Manifest
 
-`blob` parses metadata directly from the plugin's `README.md` file. The top of the README must contain the following manifest block:
+`blob` reads plugin metadata from the top of `README.md`.
 
-```markdown
+```md
 # my_plugin
 
-[authors] = {"Your Name", "Co-Author"}
-[description] = <A brief description of what the plugin does>
+[api] = 2
+[version] = 1.0.0
+[authors] = {"Your Name"}
+[description] = <What this plugin does.>
 [keybind] = x
+[mode] = note
+[permissions] = {"read-note"}
 ```
 
-* `# my_plugin`: Specifies the human-readable name of the plugin (must match the directory name).
-* `[authors] = { ... }`: A list of authors.
-* `[description] = < ... >`: A brief summary shown in `blob`'s plugin menu (`p`).
-* `[keybind] = x`: **The magic shortcut.** In the notes list view, pressing the character key defined here (e.g., `x`) will immediately execute this plugin on the selected note.
+Fields:
+
+- `# my_plugin`: Plugin name. Should match the folder name.
+- `[api] = 2`: Current plugin API. Missing means legacy API 1.
+- `[version] = 1.0.0`: Plugin version.
+- `[authors] = {...}`: Author list.
+- `[description] = <...>`: Short text shown in the plugin manager.
+- `[keybind] = x`: Shortcut from the notes list.
+- `[mode] = note`: Plugin receives the selected note path.
+- `[mode] = workspace`: Plugin receives the notes directory.
+- `[permissions] = {...}`: Declared capabilities shown before install/run.
+
+Reserved core keys:
+
+```text
+n r d D y / p : q Enter Esc arrows
+```
+
+Do not use these for plugins. If two plugins use the same key, blob marks both as conflicted.
 
 ---
 
-## 3. Invocation Protocol
+## 3. Permissions
 
-When a keypress triggers your plugin:
-1. `blob` clears its terminal region and **disables raw terminal mode**.
-2. `blob` spawns your plugin executable, passing the absolute path of the selected note as the first argument (`argv[1]`):
-   ```bash
-   addons/my_plugin/my_plugin "/path/to/notes/my-note.md"
-   ```
-3. Your plugin runs synchronously. Because raw mode is disabled, your plugin has **full control of stdout and stdin** (e.g., it can print prompts, mask passwords, or open interactive forms).
-4. When your plugin exits with status `0`, `blob` re-enables raw terminal mode and refreshes the notes list.
+Permissions are user-facing safety labels. They do not sandbox the executable. They tell users what the plugin intends to do before install and run.
+
+Existing permissions:
+
+| Permission | Use when |
+|------------|----------|
+| `read-note` | Reading the selected note file. |
+| `write-note` | Editing the selected note content. |
+| `move-note` | Renaming, moving, archiving, pinning, or trashing a note. |
+| `read-notes` | Reading multiple notes or scanning the notes directory. |
+| `write-notes` | Editing multiple notes or writing generated files into the notes directory. |
+| `network` | Accessing the internet or a remote service. |
+| `run-git` | Running `git` commands. |
+| `sensitive-input` | Asking for passwords, tokens, keys, or private data. |
+
+Pick the smallest honest set. Examples:
+
+```md
+[permissions] = {"read-note"}
+[permissions] = {"read-note","write-note"}
+[permissions] = {"network","read-notes","write-notes","run-git"}
+```
+
+Custom permissions are allowed. Use short kebab-case names:
+
+```md
+[permissions] = {"read-note","export-pdf"}
+```
+
+Add a custom permission when existing permissions are too vague. If the action already fits `write-note`, `network`, or another existing permission, use the existing permission.
+
+
+## 4. Invocation
+
+For note plugins:
+
+```bash
+addons/my_plugin/my_plugin "/path/to/notes/my-note.md"
+```
+
+For workspace plugins:
+
+```bash
+addons/fuzzy-search/fuzzy-search "/path/to/notes"
+```
+
+Before running a plugin, blob clears its terminal region, disables raw terminal mode, then waits for the plugin to exit. Your plugin can use normal stdin/stdout.
 
 ---
 
-## 4. Special Core Hooks (The `lock` Plugin)
+## 5. Special Core Hook: `lock`
 
-If a plugin is named `lock` and is compiled/installed:
-* **Automatic Decrypt on Open**: When a user presses `Enter` on a note, `blob` checks if the file starts with the signature `--- BLOB CRYPT V1 ---`. If it does, `blob` automatically executes `lock` on it. If `lock` successfully decrypts the note, `blob` opens it in the configured editor.
-* **Automatic Encrypt on Exit**: As soon as the editor closes, `blob` immediately runs `lock` on the note again to ensure it is re-encrypted before writing to disk.
+If a compiled plugin is named `lock`, blob can use it while opening encrypted notes.
+
+- On open: blob runs `lock` to decrypt before launching the editor.
+- After editor exit: blob runs `lock` again to re-encrypt.
+
+The lock plugin should declare:
+
+```md
+[mode] = note
+[permissions] = {"read-note","write-note","sensitive-input"}
+```
 
 ---
 
-## 5. C Plugin Template
-
-Here is a minimal C template to start writing your own `blob` plugin:
+## 6. Minimal Note Plugin
 
 ```c
 #include <stdio.h>
-#include <stdlib.h>
 
 int main(int argc, char **argv) {
     if (argc < 2) {
-        fprintf(stderr, "Error: No note path provided.\n");
+        fprintf(stderr, "Usage: %s <note_path>\n", argv[0]);
         return 1;
     }
 
     const char *note_path = argv[1];
-    printf("Processing note: %s\n", note_path);
+    printf("Selected note: %s\n", note_path);
 
-    // 1. Read note_path content
-    FILE *f = fopen(note_path, "r");
-    if (!f) {
-        fprintf(stderr, "Error: Could not open note file.\n");
-        return 1;
-    }
-    // ... read file ...
-    fclose(f);
-
-    // 2. Perform your operation (e.g., encryption, tags, backup)
-    
-    // 3. Write back changes if necessary
-    
-    printf("Operation completed successfully!\n");
-    return 0; // Return 0 to signal success to blob
+    return 0;
 }
 ```
 
 ---
 
-## 6. How to Build & Publish
+## 7. Publishing
 
-To distribute your addon:
-1. Write the source `.c` and `README.md` manifest.
-2. Add your plugin name to the `addons/addons.txt` index file in the repository.
-3. Submit a PR or add it to the remote repository.
-4. Users will see it in the remote repository list when they press `p`, and `blob` will download and compile it on-device automatically!
+1. Create `addons/my_plugin/my_plugin.c`.
+2. Create `addons/my_plugin/README.md` with an API 2 manifest.
+3. Add `my_plugin` to `addons/addons.txt`.
+4. Submit the plugin.
+
+Users will see it in the plugin manager and can compile it locally.

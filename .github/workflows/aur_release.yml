@@ -1,0 +1,135 @@
+name: aur_release
+
+on:
+  workflow_run:
+    workflows:
+      - release
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag, like v1.2.3"
+        required: true
+
+jobs:
+  publish:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+
+    steps:
+      - name: install tools
+        shell: bash
+        run: |
+          pacman -Sy --noconfirm --needed base-devel curl git openssh
+
+      - name: configure ssh
+        shell: bash
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          AUR_SSH_KNOWN_HOSTS: ${{ secrets.AUR_SSH_KNOWN_HOSTS }}
+        run: |
+          if [ -z "$AUR_SSH_PRIVATE_KEY" ]; then
+            echo "AUR_SSH_PRIVATE_KEY is required"
+            exit 1
+          fi
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+
+          if [ -n "$AUR_SSH_KNOWN_HOSTS" ]; then
+            printf '%s\n' "$AUR_SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          else
+            ssh-keyscan aur.archlinux.org > ~/.ssh/known_hosts
+          fi
+
+          cat > ~/.ssh/config <<'EOF'
+          Host aur.archlinux.org
+            User aur
+            IdentityFile ~/.ssh/aur
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+          EOF
+          chmod 600 ~/.ssh/config
+
+      - name: resolve version
+        id: version
+        shell: bash
+        env:
+          DISPATCH_VERSION: ${{ github.event.inputs.version }}
+          RELEASE_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          VERSION="${DISPATCH_VERSION:-$RELEASE_BRANCH}"
+          VERSION="${VERSION#refs/tags/}"
+
+          if [ -z "$VERSION" ] || [[ "$VERSION" != v* ]]; then
+            echo "Could not resolve release tag from workflow event."
+            echo "Use manual workflow_dispatch with version=vX.Y.Z."
+            exit 1
+          fi
+
+          echo "tag=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION#v}" >> "$GITHUB_OUTPUT"
+
+      - name: clone aur package
+        shell: bash
+        run: |
+          git clone ssh://aur@aur.archlinux.org/blob-bin.git aur
+
+      - name: update pkgbuild
+        working-directory: aur
+        shell: bash
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -e
+
+          echo "==> Fetching SHA256SUMS for $TAG..."
+          SUMS=$(curl -fsSL "https://github.com/aaravmaloo/blob/releases/download/$TAG/SHA256SUMS")
+
+          if [ -z "$SUMS" ]; then
+            echo "ERROR: Could not fetch SHA256SUMS. Does release $TAG exist?"
+            exit 1
+          fi
+
+          AMD64=$(echo "$SUMS" | grep 'linux-amd64/dist/blob-linux-amd64' | awk '{print $1}')
+          ARM64=$(echo "$SUMS" | grep 'linux-arm64/dist/blob-linux-arm64' | awk '{print $1}')
+
+          if [ -z "$AMD64" ] || [ -z "$ARM64" ]; then
+            echo "ERROR: Could not parse hashes from SHA256SUMS"
+            echo "$SUMS"
+            exit 1
+          fi
+
+          echo "==> amd64: $AMD64"
+          echo "==> arm64: $ARM64"
+
+          echo "==> Updating PKGBUILD..."
+          sed -i "s/pkgver=.*/pkgver=$VERSION/" PKGBUILD
+          sed -i "s/sha256sums_x86_64=('[^']*')/sha256sums_x86_64=('$AMD64')/" PKGBUILD
+          sed -i "s/sha256sums_aarch64=('[^']*')/sha256sums_aarch64=('$ARM64')/" PKGBUILD
+
+          echo "==> Regenerating .SRCINFO..."
+          makepkg --printsrcinfo > .SRCINFO
+
+      - name: commit and push
+        working-directory: aur
+        shell: bash
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add PKGBUILD .SRCINFO
+          if git diff --cached --quiet; then
+            echo "No AUR changes to publish."
+            exit 0
+          fi
+
+          git commit -m "update to $TAG"
+          git push
