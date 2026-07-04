@@ -138,7 +138,8 @@ typedef enum {
     KEY_DOWN,
     KEY_LEFT,
     KEY_RIGHT,
-    KEY_CTRL_P
+    KEY_CTRL_P,
+    KEY_CTRL_R
 } KeyType;
 
 typedef struct {
@@ -261,6 +262,10 @@ static KeyEvent read_key(void) {
         key.type = KEY_CTRL_P;
         return key;
     }
+    if (c == 18) {
+        key.type = KEY_CTRL_R;
+        return key;
+    }
     if (c == 0 || c == 224) {
         int ext = _getch();
         if (ext == 72) key.type = KEY_UP;
@@ -289,6 +294,10 @@ static KeyEvent read_key(void) {
     }
     if (c == 16) {
         key.type = KEY_CTRL_P;
+        return key;
+    }
+    if (c == 18) {
+        key.type = KEY_CTRL_R;
         return key;
     }
     if (c == '\x1b') {
@@ -829,6 +838,8 @@ static void render_ui(AppState *state) {
         render_line(state, help_line);
         snprintf(help_line, sizeof(help_line), "%s[p] plugins%s", g_theme.help, ANSI_RESET);
         render_line(state, help_line);
+        snprintf(help_line, sizeof(help_line), "%s[Ctrl+R] reminders%s", g_theme.help, ANSI_RESET);
+        render_line(state, help_line);
         snprintf(help_line, sizeof(help_line), "%s[q] quit%s", g_theme.help, ANSI_RESET);
         render_line(state, help_line);
     }
@@ -1195,7 +1206,6 @@ static void render_trash_ui(AppState *state, const NoteList *trash, size_t sel) 
     }
     fflush(stdout);
 }
-#endif
 
 static void trash_viewer_flow(AppState *state, const AppConfig *cfg) {
     NoteList trash = {NULL, 0, 0};
@@ -1251,6 +1261,7 @@ static void trash_viewer_flow(AppState *state, const AppConfig *cfg) {
     note_list_free(&trash);
     state->rendered_lines = 0;
 }
+#endif
 
 static void rename_note_flow(AppState *state, const AppConfig *cfg) {
     if (state->notes.count == 0 || !selected_is_visible(state)) {
@@ -2337,6 +2348,114 @@ static bool run_named_plugin(AppState *state, const AppConfig *cfg, const char *
     return false;
 }
 
+#ifndef BLOB_TEST
+static void show_reminders_flow(AppState *state, const AppConfig *cfg) {
+    /* reminders.txt format: one reminder per line
+     * <ring_at_unix_timestamp>\t<note_title>\n */
+    char rem_path[PATH_MAX];
+    snprintf(rem_path, sizeof(rem_path), "%s" PATH_SEP "reminders.txt", cfg->data_dir);
+
+    clear_owned_region(state);
+    render_line(state, ANSI_BOLD "blob: active reminders" ANSI_RESET);
+    render_line(state, "");
+
+    FILE *f = fopen(rem_path, "r");
+    if (!f) {
+        render_line(state, ANSI_DIM "no reminders set" ANSI_RESET);
+        render_line(state, "");
+        render_line(state, ANSI_DIM "────────────────────────────────" ANSI_RESET);
+        render_line(state, "");
+        char hl[128];
+        snprintf(hl, sizeof(hl), "%s[ESC/q] back%s", g_theme.help, ANSI_RESET);
+        render_line(state, hl);
+        fflush(stdout);
+        KeyEvent k = read_key();
+        (void)k;
+        state->rendered_lines = 0;
+        return;
+    }
+
+    time_t now = time(NULL);
+
+    /* First pass: read all, decide which to keep, collect display rows */
+    typedef struct { long ring_at; char title[256]; } Rem;
+    Rem rems[64];
+    size_t nrems = 0;
+
+    char line[512];
+    while (fgets(line, sizeof(line), f) && nrems < 64) {
+        long ring_at = 0;
+        char title[256];
+        title[0] = '\0';
+        /* parse: "<timestamp>\t<title>\n" */
+        char *tab = strchr(line, '\t');
+        if (!tab) continue;
+        *tab = '\0';
+        ring_at = atol(line);
+        snprintf(title, sizeof(title), "%s", tab + 1);
+        /* strip trailing newline */
+        size_t tlen = strlen(title);
+        while (tlen > 0 && (title[tlen-1] == '\n' || title[tlen-1] == '\r')) {
+            title[--tlen] = '\0';
+        }
+        if (ring_at <= 0 || title[0] == '\0') continue;
+        /* drop reminders that fired more than 1 hour ago */
+        if ((long)now - ring_at > 3600) continue;
+        rems[nrems].ring_at = ring_at;
+        snprintf(rems[nrems].title, sizeof(rems[nrems].title), "%s", title);
+        nrems++;
+    }
+    fclose(f);
+
+    /* rewrite file with only kept entries */
+    f = fopen(rem_path, "w");
+    if (f) {
+        for (size_t i = 0; i < nrems; i++) {
+            fprintf(f, "%ld\t%s\n", rems[i].ring_at, rems[i].title);
+        }
+        fclose(f);
+    }
+
+    if (nrems == 0) {
+        render_line(state, ANSI_DIM "no active reminders" ANSI_RESET);
+    } else {
+        for (size_t i = 0; i < nrems; i++) {
+            long diff = rems[i].ring_at - (long)now;
+            char time_str[64];
+            if (diff > 0) {
+                long h = diff / 3600;
+                long m = (diff % 3600) / 60;
+                long s = diff % 60;
+                if (h > 0)      snprintf(time_str, sizeof(time_str), "in %ldh %ldm", h, m);
+                else if (m > 0) snprintf(time_str, sizeof(time_str), "in %ldm %lds", m, s);
+                else            snprintf(time_str, sizeof(time_str), "in %lds", s);
+            } else {
+                long ago = -diff;
+                long m = ago / 60;
+                snprintf(time_str, sizeof(time_str), "fired %ldm ago", m);
+            }
+            char row[512];
+            snprintf(row, sizeof(row), "  %s%-40s%s %s%s%s",
+                     g_theme.title, rems[i].title, ANSI_RESET,
+                     g_theme.timestamp, time_str, ANSI_RESET);
+            render_line(state, row);
+        }
+    }
+
+    render_line(state, "");
+    render_line(state, ANSI_DIM "────────────────────────────────" ANSI_RESET);
+    render_line(state, "");
+    char hl[128];
+    snprintf(hl, sizeof(hl), "%s[ESC/q] back%s", g_theme.help, ANSI_RESET);
+    render_line(state, hl);
+    fflush(stdout);
+
+    /* wait for any keypress to dismiss */
+    KeyEvent k;
+    do { k = read_key(); } while (k.type == KEY_NONE);
+    state->rendered_lines = 0;
+}
+
 static void command_palette_flow(AppState *state, const AppConfig *cfg) {
     char command[INPUT_MAX];
     command[0] = '\0';
@@ -2356,8 +2475,10 @@ static void command_palette_flow(AppState *state, const AppConfig *cfg) {
         delete_note_flow(state, cfg);
     } else if (strcmp(command, "hard delete") == 0 || strcmp(command, "purge") == 0) {
         hard_delete_note_flow(state, cfg);
-    } else if (strcmp(command, "restore") == 0 || strcmp(command, "trash") == 0) {
+    } else if (strcmp(command, "restore") == 0 || strcmp(command, "bin") == 0) {
         trash_viewer_flow(state, cfg);
+    } else if (strcmp(command, "reminders") == 0 || strcmp(command, "remind") == 0) {
+        show_reminders_flow(state, cfg);
     } else if (strcmp(command, "copy path") == 0 || strcmp(command, "copy") == 0) {
         copy_path_to_clipboard(state, cfg);
     } else if (strcmp(command, "plugins") == 0 || strcmp(command, "plugin") == 0) {
@@ -2368,6 +2489,7 @@ static void command_palette_flow(AppState *state, const AppConfig *cfg) {
         snprintf(state->status, sizeof(state->status), "unknown command: %s", command);
     }
 }
+#endif
 
 #ifndef BLOB_TEST
 static void handle_key(AppState *state, const AppConfig *cfg, KeyEvent key) {
@@ -2390,6 +2512,11 @@ static void handle_key(AppState *state, const AppConfig *cfg, KeyEvent key) {
             return;
         }
         handle_search_key(state, key);
+        return;
+    }
+
+    if (key.type == KEY_CTRL_R) {
+        show_reminders_flow(state, cfg);
         return;
     }
 

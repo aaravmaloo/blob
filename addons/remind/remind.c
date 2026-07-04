@@ -7,6 +7,9 @@
  *   macOS   : osascript display notification
  *   Linux   : notify-send (libnotify) — falls back to wall/echo if missing
  *
+ * Persists reminder to $data_dir/reminders.txt so Ctrl+R in blob shows
+ * all active reminders with time remaining.
+ *
  * Usage: remind <note_path>
  */
 
@@ -15,14 +18,46 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #ifdef _WIN32
 #include <windows.h>
+#define PATH_SEP "\\"
 #else
 #include <unistd.h>
+#define PATH_SEP "/"
 #endif
 
-/* ── helpers ────────────────────────────────────────── */
+/* ── path helpers ───────────────────────────────────── */
+
+/* Extract the parent directory of a path (modifies a copy). */
+static void get_dirname(const char *path, char *out, size_t out_size) {
+    snprintf(out, out_size, "%s", path);
+    char *last = NULL;
+    for (char *p = out; *p; p++) {
+        if (*p == '/' || *p == '\\') last = p;
+    }
+    if (last && last != out) {
+        *last = '\0';
+    } else if (last == out) {
+        /* root-level path */
+        out[1] = '\0';
+    } else {
+        out[0] = '.'; out[1] = '\0';
+    }
+}
+
+/* Derive the blob data_dir from a note path.
+ * note_path  = $data_dir/notes/my-note.md
+ * notes_dir  = dirname(note_path)  → $data_dir/notes
+ * data_dir   = dirname(notes_dir)  → $data_dir             */
+static void get_data_dir(const char *note_path, char *data_dir, size_t sz) {
+    char notes_dir[4096];
+    get_dirname(note_path, notes_dir, sizeof(notes_dir));
+    get_dirname(notes_dir, data_dir, sz);
+}
+
+/* ── note title ─────────────────────────────────────── */
 
 static void get_note_title(const char *path, char *title, size_t sz) {
     const char *base = path;
@@ -50,24 +85,21 @@ static void get_note_title(const char *path, char *title, size_t sz) {
     fclose(f);
 }
 
-/* Parse strings like "30", "30m", "1h", "2h30m", "90m".
- * Returns total seconds, or -1 on error. */
+/* ── delay parser ───────────────────────────────────── */
+
+/* Accepts: "30" "30m" "1h" "2h30m" — returns total seconds or -1 on error */
 static long parse_delay(const char *s) {
     long hours = 0, minutes = 0;
     const char *p = s;
 
     while (*p && isspace((unsigned char)*p)) p++;
-    if (!*p) return -1;
+    if (!*p || !isdigit((unsigned char)*p)) return -1;
 
-    /* read leading number */
     long n = 0;
-    if (!isdigit((unsigned char)*p)) return -1;
     while (isdigit((unsigned char)*p)) n = n * 10 + (*p++ - '0');
 
     if (*p == 'h' || *p == 'H') {
-        hours = n;
-        p++;
-        /* optional minutes after 'h' */
+        hours = n; p++;
         n = 0;
         while (isdigit((unsigned char)*p)) n = n * 10 + (*p++ - '0');
         if (*p == 'm' || *p == 'M') { minutes = n; p++; }
@@ -79,7 +111,7 @@ static long parse_delay(const char *s) {
     }
 
     while (*p && isspace((unsigned char)*p)) p++;
-    if (*p) return -1;  /* trailing garbage */
+    if (*p) return -1;
 
     long total = hours * 3600L + minutes * 60L;
     return total > 0 ? total : -1;
@@ -88,30 +120,43 @@ static long parse_delay(const char *s) {
 static void format_delay(long seconds, char *buf, size_t sz) {
     long h = seconds / 3600;
     long m = (seconds % 3600) / 60;
-    if (h > 0 && m > 0)      snprintf(buf, sz, "%ldh %ldm", h, m);
-    else if (h > 0)           snprintf(buf, sz, "%ldh", h);
-    else                      snprintf(buf, sz, "%ldm", m);
+    if (h > 0 && m > 0)  snprintf(buf, sz, "%ldh %ldm", h, m);
+    else if (h > 0)      snprintf(buf, sz, "%ldh", h);
+    else                 snprintf(buf, sz, "%ldm", m);
 }
 
-/* ── platform scheduling ─────────────────────────── */
+/* ── persist reminder ───────────────────────────────── */
+
+/* Append one line to data_dir/reminders.txt:
+ *   <ring_at_unix_timestamp>\t<note_title>\n
+ * The file is read by blob core (Ctrl+R) to show active reminders. */
+static void save_reminder(const char *note_path, long ring_at, const char *title) {
+    char data_dir[4096];
+    get_data_dir(note_path, data_dir, sizeof(data_dir));
+
+    char rem_path[4096 + 32];
+    snprintf(rem_path, sizeof(rem_path), "%s" PATH_SEP "reminders.txt", data_dir);
+
+    FILE *f = fopen(rem_path, "a");
+    if (!f) return;
+    fprintf(f, "%ld\t%s\n", ring_at, title);
+    fclose(f);
+}
+
+/* ── platform scheduling ─────────────────────────────── */
 
 #ifdef _WIN32
 
 static int schedule_windows(long delay_sec, const char *title) {
-    /* Build a PowerShell one-liner that:
-     *   1. waits delay_sec seconds (Start-Sleep)
-     *   2. pops a MessageBox via WinForms
-     * Run it hidden and detached so it survives after this process exits. */
-    char ps[2048];
-    /* escape single quotes in title */
     char safe_title[512];
     size_t j = 0;
     for (size_t i = 0; title[i] && j + 2 < sizeof(safe_title); i++) {
-        if (title[i] == '\'') safe_title[j++] = '\''; /* double it */
+        if (title[i] == '\'') safe_title[j++] = '\'';
         safe_title[j++] = title[i];
     }
     safe_title[j] = '\0';
 
+    char ps[2048];
     snprintf(ps, sizeof(ps),
         "Start-Sleep -Seconds %ld; "
         "Add-Type -AssemblyName System.Windows.Forms; "
@@ -127,7 +172,6 @@ static int schedule_windows(long delay_sec, const char *title) {
              "powershell -WindowStyle Hidden -NonInteractive -Command \"%s\"",
              ps);
 
-    /* Use CreateProcess so we can set CREATE_NO_WINDOW + detach */
     STARTUPINFOA si;
     PROCESS_INFORMATION pi;
     ZeroMemory(&si, sizeof(si));
@@ -135,8 +179,7 @@ static int schedule_windows(long delay_sec, const char *title) {
     si.cb = sizeof(si);
 
     BOOL ok = CreateProcessA(
-        NULL, cmd,
-        NULL, NULL, FALSE,
+        NULL, cmd, NULL, NULL, FALSE,
         CREATE_NO_WINDOW | DETACHED_PROCESS,
         NULL, NULL, &si, &pi);
 
@@ -147,7 +190,7 @@ static int schedule_windows(long delay_sec, const char *title) {
     return ok ? 0 : 1;
 }
 
-#else /* POSIX */
+#else
 
 static int command_exists_posix(const char *name) {
     char cmd[128];
@@ -156,13 +199,10 @@ static int command_exists_posix(const char *name) {
 }
 
 static int schedule_posix(long delay_sec, const char *title) {
-    /* Escape double quotes and backslashes for shell embedding */
     char safe[512];
     size_t j = 0;
     for (size_t i = 0; title[i] && j + 3 < sizeof(safe); i++) {
-        if (title[i] == '"' || title[i] == '\\' || title[i] == '\'') {
-            safe[j++] = '\\';
-        }
+        if (title[i] == '"' || title[i] == '\\' || title[i] == '\'') safe[j++] = '\\';
         safe[j++] = title[i];
     }
     safe[j] = '\0';
@@ -170,14 +210,12 @@ static int schedule_posix(long delay_sec, const char *title) {
     char script[2048];
 
 #if defined(__APPLE__)
-    /* macOS — osascript notification */
     snprintf(script, sizeof(script),
              "sleep %ld && osascript -e "
              "'display notification \"%s\" with title \"blob reminder\"' "
              ">/dev/null 2>&1",
              delay_sec, safe);
 #else
-    /* Linux — prefer notify-send, fall back to wall */
     if (command_exists_posix("notify-send")) {
         snprintf(script, sizeof(script),
                  "sleep %ld && notify-send 'blob reminder' '%s' >/dev/null 2>&1",
@@ -189,7 +227,6 @@ static int schedule_posix(long delay_sec, const char *title) {
     }
 #endif
 
-    /* Wrap in nohup + bash so it survives this process exiting */
     char full_cmd[2200];
     snprintf(full_cmd, sizeof(full_cmd),
              "nohup bash -c '%s' >/dev/null 2>&1 &",
@@ -198,7 +235,7 @@ static int schedule_posix(long delay_sec, const char *title) {
     return system(full_cmd) == 0 ? 0 : 1;
 }
 
-#endif /* POSIX */
+#endif
 
 /* ── main ───────────────────────────────────────────── */
 
@@ -220,7 +257,6 @@ int main(int argc, char **argv) {
 
     char input[64];
     if (!fgets(input, sizeof(input), stdin)) return 1;
-    /* strip newline */
     input[strcspn(input, "\r\n")] = '\0';
 
     if (!input[0]) {
@@ -256,7 +292,12 @@ int main(int argc, char **argv) {
         printf("  \033[31mFailed to schedule reminder.\033[0m\n");
         printf("  On Linux, make sure 'nohup' and 'bash' are available.\n");
     } else {
+        /* persist so Ctrl+R in blob shows it with time remaining */
+        long ring_at = (long)time(NULL) + delay;
+        save_reminder(argv[1], ring_at, title);
+
         printf("  \033[32mReminder set!\033[0m You will be notified in %s.\n", delay_str);
+        printf("  \033[2mPress Ctrl+R in blob to view active reminders.\033[0m\n");
     }
 
     printf("\n  Press Enter to return...");
