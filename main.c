@@ -819,6 +819,8 @@ static void render_ui(AppState *state) {
         render_line(state, help_line);
         snprintf(help_line, sizeof(help_line), "%s[D] delete%s", g_theme.help, ANSI_RESET);
         render_line(state, help_line);
+        snprintf(help_line, sizeof(help_line), "%s[t] trash bin%s", g_theme.help, ANSI_RESET);
+        render_line(state, help_line);
         snprintf(help_line, sizeof(help_line), "%s[y] copy path%s", g_theme.help, ANSI_RESET);
         render_line(state, help_line);
         snprintf(help_line, sizeof(help_line), "%s[/] search%s", g_theme.help, ANSI_RESET);
@@ -1085,81 +1087,169 @@ static void hard_delete_note_flow(AppState *state, const AppConfig *cfg) {
     normalize_selection(state);
 }
 
-static void restore_note_flow(AppState *state, const AppConfig *cfg) {
+/* ── interactive trash viewer ───────────────────────────────────────────── */
+
+static bool load_trash_notes(NoteList *list, const AppConfig *cfg) {
+    note_list_free(list);
     char trash_dir[PATH_MAX];
     snprintf(trash_dir, sizeof(trash_dir), "%s" PATH_SEP ".trash", cfg->notes_dir);
-
-    char query[INPUT_MAX];
-    query[0] = '\0';
-    if (!prompt_text(state, "Restore note contains", query, sizeof(query))) {
-        return;
-    }
 
 #ifdef _WIN32
     char pattern[PATH_MAX];
     snprintf(pattern, sizeof(pattern), "%s" PATH_SEP "*.md", trash_dir);
     WIN32_FIND_DATAA data;
     HANDLE find = FindFirstFileA(pattern, &data);
-    if (find == INVALID_HANDLE_VALUE) {
-        snprintf(state->status, sizeof(state->status), "trash is empty");
-        return;
-    }
-
+    if (find == INVALID_HANDLE_VALUE) return true;
     do {
         if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-        char title[TITLE_MAX];
-        title_from_filename(title, sizeof(title), data.cFileName);
-        if (!contains_case_insensitive(title, query) && !contains_case_insensitive(data.cFileName, query)) continue;
-
-        char src[PATH_MAX];
-        char dst[PATH_MAX];
-        snprintf(src, sizeof(src), "%s" PATH_SEP "%s", trash_dir, data.cFileName);
-        unique_path_in_dir(cfg->notes_dir, data.cFileName, dst, sizeof(dst));
-        FindClose(find);
-        if (rename(src, dst) != 0) {
-            snprintf(state->status, sizeof(state->status), "failed to restore note: %s", strerror(errno));
-        } else {
-            snprintf(state->status, sizeof(state->status), "restored %s", data.cFileName);
-            load_notes(&state->notes, cfg);
-            normalize_selection(state);
-        }
-        return;
+        Note note;
+        memset(&note, 0, sizeof(note));
+        snprintf(note.filename, sizeof(note.filename), "%s", data.cFileName);
+        title_from_filename(note.title, sizeof(note.title), note.filename);
+        snprintf(note.path, sizeof(note.path), "%s" PATH_SEP "%s", trash_dir, note.filename);
+        struct stat st;
+        if (stat(note.path, &st) == 0) note.mtime = st.st_mtime;
+        if (!note_list_push(list, &note)) { FindClose(find); return false; }
     } while (FindNextFileA(find, &data));
     FindClose(find);
 #else
     DIR *dir = opendir(trash_dir);
-    if (!dir) {
-        snprintf(state->status, sizeof(state->status), "trash is empty");
-        return;
-    }
-
+    if (!dir) return true;
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
         if (!has_md_extension(entry->d_name)) continue;
-        char title[TITLE_MAX];
-        title_from_filename(title, sizeof(title), entry->d_name);
-        if (!contains_case_insensitive(title, query) && !contains_case_insensitive(entry->d_name, query)) continue;
-
-        char filename[TITLE_MAX];
-        snprintf(filename, sizeof(filename), "%s", entry->d_name);
-        char src[PATH_MAX];
-        char dst[PATH_MAX];
-        snprintf(src, sizeof(src), "%s" PATH_SEP "%s", trash_dir, filename);
-        unique_path_in_dir(cfg->notes_dir, filename, dst, sizeof(dst));
-        closedir(dir);
-        if (rename(src, dst) != 0) {
-            snprintf(state->status, sizeof(state->status), "failed to restore note: %s", strerror(errno));
-        } else {
-            snprintf(state->status, sizeof(state->status), "restored %s", filename);
-            load_notes(&state->notes, cfg);
-            normalize_selection(state);
+        Note note;
+        memset(&note, 0, sizeof(note));
+        snprintf(note.filename, sizeof(note.filename), "%s", entry->d_name);
+        title_from_filename(note.title, sizeof(note.title), note.filename);
+        snprintf(note.path, sizeof(note.path), "%s" PATH_SEP "%s", trash_dir, entry->d_name);
+        struct stat st;
+        if (stat(note.path, &st) == 0 && STAT_ISREG(st.st_mode)) {
+            note.mtime = st.st_mtime;
+            if (!note_list_push(list, &note)) { closedir(dir); return false; }
         }
-        return;
     }
     closedir(dir);
 #endif
+    qsort(list->items, list->count, sizeof(*list->items), note_cmp);
+    return true;
+}
 
-    snprintf(state->status, sizeof(state->status), "no trash match");
+#ifndef BLOB_TEST
+static void render_trash_ui(AppState *state, const NoteList *trash, size_t sel) {
+    clear_owned_region(state);
+    render_line(state, ANSI_BOLD "blob: trash" ANSI_RESET);
+    render_line(state, "");
+
+    if (trash->count == 0) {
+        render_line(state, ANSI_DIM "trash is empty" ANSI_RESET);
+    } else {
+        size_t start = 0;
+        if (sel >= VISIBLE_NOTES) start = sel - VISIBLE_NOTES + 1;
+        size_t shown = 0;
+        for (size_t i = start; i < trash->count && shown < VISIBLE_NOTES; i++, shown++) {
+            char time_buf[32];
+            format_relative_time(trash->items[i].mtime, time_buf, sizeof(time_buf));
+            char line[TITLE_MAX + 64];
+            const char *prefix = (i == sel) ? g_theme.selected : "";
+            snprintf(line, sizeof(line), "%s> %s%-40s%s %s%s%s",
+                     prefix,
+                     g_theme.title,
+                     trash->items[i].title,
+                     ANSI_RESET,
+                     g_theme.timestamp,
+                     time_buf,
+                     ANSI_RESET);
+            render_line(state, line);
+        }
+        if (trash->count > VISIBLE_NOTES) {
+            char pg[64];
+            snprintf(pg, sizeof(pg), "%sShowing %zu-%zu of %zu%s",
+                     g_theme.pagination,
+                     start + 1,
+                     start + shown,
+                     trash->count,
+                     ANSI_RESET);
+            render_line(state, pg);
+        }
+    }
+
+    render_line(state, "");
+    render_line(state, ANSI_DIM "────────────────────────────────" ANSI_RESET);
+    render_line(state, "");
+
+    char help[128];
+    snprintf(help, sizeof(help), "%s[ENTER] restore%s", g_theme.help, ANSI_RESET);
+    render_line(state, help);
+    snprintf(help, sizeof(help), "%s[D] permanently delete%s", g_theme.help, ANSI_RESET);
+    render_line(state, help);
+    snprintf(help, sizeof(help), "%s[ESC/q] back%s", g_theme.help, ANSI_RESET);
+    render_line(state, help);
+
+    if (state->status[0]) {
+        render_line(state, "");
+        char sl[INPUT_MAX + 16];
+        snprintf(sl, sizeof(sl), "%s%s%s", g_theme.status, state->status, ANSI_RESET);
+        render_line(state, sl);
+        state->status[0] = '\0';
+    }
+    fflush(stdout);
+}
+#endif
+
+static void trash_viewer_flow(AppState *state, const AppConfig *cfg) {
+    NoteList trash = {NULL, 0, 0};
+    load_trash_notes(&trash, cfg);
+
+    size_t sel = 0;
+    bool running = true;
+
+    while (running) {
+        render_trash_ui(state, &trash, sel);
+        KeyEvent key = read_key();
+
+        if (key.type == KEY_UP) {
+            if (sel > 0) sel--;
+        } else if (key.type == KEY_DOWN) {
+            if (trash.count > 0 && sel + 1 < trash.count) sel++;
+        } else if (key.type == KEY_ESCAPE ||
+                   (key.type == KEY_CHAR && key.ch == 'q')) {
+            running = false;
+        } else if (key.type == KEY_ENTER) {
+            if (trash.count == 0) continue;
+            Note *n = &trash.items[sel];
+            char dst[PATH_MAX];
+            unique_path_in_dir(cfg->notes_dir, n->filename, dst, sizeof(dst));
+            if (rename(n->path, dst) != 0) {
+                snprintf(state->status, sizeof(state->status),
+                         "failed to restore: %s", strerror(errno));
+            } else {
+                snprintf(state->status, sizeof(state->status),
+                         "restored \"%s\"", n->title);
+                load_trash_notes(&trash, cfg);
+                if (sel > 0 && sel >= trash.count) sel = trash.count > 0 ? trash.count - 1 : 0;
+                load_notes(&state->notes, cfg);
+                normalize_selection(state);
+            }
+        } else if (key.type == KEY_CHAR && key.ch == 'D') {
+            if (trash.count == 0) continue;
+            Note *n = &trash.items[sel];
+            char msg[TITLE_MAX + 48];
+            snprintf(msg, sizeof(msg), "Permanently delete \"%s\"?", n->title);
+            if (prompt_confirm(state, msg)) {
+                if (unlink(n->path) != 0) {
+                    snprintf(state->status, sizeof(state->status),
+                             "delete failed: %s", strerror(errno));
+                } else {
+                    load_trash_notes(&trash, cfg);
+                    if (sel > 0 && sel >= trash.count) sel = trash.count > 0 ? trash.count - 1 : 0;
+                }
+            }
+        }
+    }
+
+    note_list_free(&trash);
+    state->rendered_lines = 0;
 }
 
 static void rename_note_flow(AppState *state, const AppConfig *cfg) {
@@ -1409,7 +1499,7 @@ static void set_plugin_disabled_on_disk(const AppConfig *cfg, const char *name, 
 }
 
 static bool key_is_core_reserved(char key) {
-    const char *reserved = "nrdDy/p:q";
+    const char *reserved = "nrdDty/p:q";
     return key && (strchr(reserved, key) != NULL || key == '\r' || key == '\n');
 }
 
@@ -2266,8 +2356,8 @@ static void command_palette_flow(AppState *state, const AppConfig *cfg) {
         delete_note_flow(state, cfg);
     } else if (strcmp(command, "hard delete") == 0 || strcmp(command, "purge") == 0) {
         hard_delete_note_flow(state, cfg);
-    } else if (strcmp(command, "restore") == 0) {
-        restore_note_flow(state, cfg);
+    } else if (strcmp(command, "restore") == 0 || strcmp(command, "trash") == 0) {
+        trash_viewer_flow(state, cfg);
     } else if (strcmp(command, "copy path") == 0 || strcmp(command, "copy") == 0) {
         copy_path_to_clipboard(state, cfg);
     } else if (strcmp(command, "plugins") == 0 || strcmp(command, "plugin") == 0) {
@@ -2322,6 +2412,9 @@ static void handle_key(AppState *state, const AppConfig *cfg, KeyEvent key) {
         break;
     case 'D':
         hard_delete_note_flow(state, cfg);
+        break;
+    case 't':
+        trash_viewer_flow(state, cfg);
         break;
     case 'y':
         copy_path_to_clipboard(state, cfg);
