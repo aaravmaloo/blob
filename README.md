@@ -19,6 +19,7 @@
 - markdown note creation
 - live note search
 - rename, trash, restore, and hard delete flows
+- interactive trash bin viewer (`t`) — browse, restore, or purge trashed notes
 - command palette for core actions and installed plugins
 - relative timestamps and pagination
 - safer plugin installs with API, mode, and permission metadata
@@ -71,6 +72,7 @@ make release
 | `r` | Rename note |
 | `d` | Move note to trash |
 | `D` | Permanently delete note |
+| `t` | Open trash bin (restore or permanently delete trashed notes) |
 | `y` | Copy note path |
 | `/` | Search notes |
 | `:` | Open command palette |
@@ -84,7 +86,23 @@ blob supports optional, compiled plugins to extend its features (like encryption
 
 Plugins declare an API version, run mode, and permissions in their README manifest. blob warns about legacy plugins, keybind conflicts, and plugins that require a newer API.
 
-If you are a developer and want to create your own plugin, see [PLUGIN_DEVELOPMENT.md](file:///C:/Users/Aarav%20Maloo/Desktop/blob/PLUGIN_DEVELOPMENT.md).
+### Built-in plugins
+
+| Plugin | Key | What it does |
+|--------|-----|--------------|
+| `lock` | — | Encrypt/decrypt notes with a password |
+| `stats` | `s` | Show character, word, and line counts |
+| `archive` | `a` | Move notes to an archive folder |
+| `git-sync` | `g` | Commit and push notes to a git repo |
+| `pin` | `i` | Pin/unpin notes (floated to top with prefix) |
+| `fuzzy-search` | `f` | Fuzzy search across note titles and content |
+| `tags` | `z` | Read, add, and clear tags metadata |
+| `word-count` | `w` | Words, chars, lines, sentences, reading time |
+| `open-dir` | `o` | Open the note's folder in your file explorer |
+| `export` | `e` | Export to HTML, PDF, or DOCX via pandoc |
+| `remind` | `m` | Set a timed system notification for a note |
+
+If you are a developer and want to create your own plugin, see [PLUGIN_DEVELOPMENT.md](PLUGIN_DEVELOPMENT.md).
 
 ## Storage
 
