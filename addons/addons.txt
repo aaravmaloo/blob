@@ -5,3 +5,7 @@ git-sync
 pin
 fuzzy-search
 tags
+word-count
+open-dir
+export
+remind
