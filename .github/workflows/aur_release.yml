@@ -49,15 +49,8 @@ jobs:
           fi
           chmod 644 "$SSH_DIR/known_hosts"
 
-          # NOTE: no leading whitespace — SSH config is whitespace-sensitive
-          cat > "$SSH_DIR/config" <<EOF
-Host aur.archlinux.org
-  User aur
-  IdentityFile $SSH_DIR/aur
-  IdentitiesOnly yes
-  StrictHostKeyChecking yes
-  UserKnownHostsFile $SSH_DIR/known_hosts
-EOF
+          # NOTE: using printf instead of heredoc to avoid YAML indentation conflicts
+          printf 'Host aur.archlinux.org\n  User aur\n  IdentityFile %s/aur\n  IdentitiesOnly yes\n  StrictHostKeyChecking yes\n  UserKnownHostsFile %s/known_hosts\n' "$SSH_DIR" "$SSH_DIR" > "$SSH_DIR/config"
           chmod 600 "$SSH_DIR/config"
 
       - name: resolve version
