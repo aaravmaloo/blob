@@ -2,6 +2,8 @@
 
 #define _DEFAULT_SOURCE
 
+#define BLOB_VERSION "1.1.2"
+
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
@@ -751,7 +753,7 @@ static void render_ui(AppState *state) {
     normalize_selection(state);
     clear_owned_region(state);
 
-    render_line(state, ANSI_BOLD "blob v1.0.0-debug" ANSI_RESET);
+    render_line(state, ANSI_BOLD "blob v" BLOB_VERSION ANSI_RESET);
     render_line(state, "");
 
     if (state->search_mode || state->search[0]) {
