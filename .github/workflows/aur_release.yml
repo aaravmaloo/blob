@@ -36,25 +36,29 @@ jobs:
             exit 1
           fi
 
-          mkdir -p ~/.ssh
-          chmod 700 ~/.ssh
-          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur
-          chmod 600 ~/.ssh/aur
+          SSH_DIR="$HOME/.ssh"
+          mkdir -p "$SSH_DIR"
+          chmod 700 "$SSH_DIR"
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > "$SSH_DIR/aur"
+          chmod 600 "$SSH_DIR/aur"
 
           if [ -n "$AUR_SSH_KNOWN_HOSTS" ]; then
-            printf '%s\n' "$AUR_SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+            printf '%s\n' "$AUR_SSH_KNOWN_HOSTS" > "$SSH_DIR/known_hosts"
           else
-            ssh-keyscan aur.archlinux.org > ~/.ssh/known_hosts
+            ssh-keyscan -H aur.archlinux.org > "$SSH_DIR/known_hosts"
           fi
+          chmod 644 "$SSH_DIR/known_hosts"
 
-          cat > ~/.ssh/config <<'EOF'
-          Host aur.archlinux.org
-            User aur
-            IdentityFile ~/.ssh/aur
-            IdentitiesOnly yes
-            StrictHostKeyChecking yes
-          EOF
-          chmod 600 ~/.ssh/config
+          # NOTE: no leading whitespace — SSH config is whitespace-sensitive
+          cat > "$SSH_DIR/config" <<EOF
+Host aur.archlinux.org
+  User aur
+  IdentityFile $SSH_DIR/aur
+  IdentitiesOnly yes
+  StrictHostKeyChecking yes
+  UserKnownHostsFile $SSH_DIR/known_hosts
+EOF
+          chmod 600 "$SSH_DIR/config"
 
       - name: resolve version
         id: version
