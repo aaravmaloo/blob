@@ -21,12 +21,30 @@
 - rename, trash, restore, and hard delete flows
 - interactive trash bin viewer (`t`) — browse, restore, or purge trashed notes
 - command palette for core actions and installed plugins
+- favorites / starred notes (`*`) — float favourite notes to the top
+- config file (`~/.local/share/blob/config`) — persistent editor, theme, and sort settings
+- built-in themes — dark, light, dracula, solarized presets with a plugin switcher
 - relative timestamps and pagination
 - safer plugin installs with API, mode, and permission metadata
 - customizability
 
 ## Customizing blob
-In the future, blob will support themes. For now, you can configure the editor that blob will use to edit the notes. This can be set via the `EDITOR` environment variable, and will force blob to use that editor. 
+
+blob reads `~/.local/share/blob/config` on startup. The config file uses a simple `key = value` format:
+
+```
+editor = nvim
+theme = dracula
+sort = mtime
+```
+
+| Setting  | Description |
+|----------|-------------|
+| `editor` | Overrides `$EDITOR` (default: `vim` on macOS/Linux, `notepad` on Windows) |
+| `theme`  | Color preset: `default`, `dark`, `light`, `dracula`, `solarized` |
+| `sort`   | Sort order (reserved for future use) |
+
+You can also set the editor via the `EDITOR` environment variable — the config file takes precedence.
 
 ## Installation
 blob can be installed via yay, brew, winget, [github releases](https://github.com/aaravmaloo/blob/releases), or can be compiled from scratch.
@@ -81,9 +99,11 @@ make release
 | `D` | Permanently delete note |
 | `t` | Open trash bin (restore or permanently delete trashed notes) |
 | `y` | Copy note path |
+| `*` | Star / unstar note (floats to top) |
 | `/` | Search notes |
 | `:` | Open command palette |
 | `p` | Open plugins manager |
+| `Ctrl+R` | Show reminders |
 | `Esc` | Clear search |
 | `q` | Quit |
 
@@ -108,6 +128,7 @@ Plugins declare an API version, run mode, and permissions in their README manife
 | `open-dir` | `o` | Open the note's folder in your file explorer |
 | `export` | `e` | Export to HTML, PDF, or DOCX via pandoc |
 | `remind` | `m` | Set a timed system notification for a note |
+| `themes` | `c` | Select and apply a built-in color theme |
 
 If you are a developer and want to create your own plugin, see [PLUGIN_DEVELOPMENT.md](PLUGIN_DEVELOPMENT.md).
 

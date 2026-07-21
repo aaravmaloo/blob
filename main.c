@@ -2,7 +2,7 @@
 
 #define _DEFAULT_SOURCE
 
-#define BLOB_VERSION "1.1.2"
+#define BLOB_VERSION "1.2.0"
 
 #include <ctype.h>
 #include <errno.h>
@@ -104,7 +104,11 @@ typedef struct {
     char data_dir[PATH_MAX];
     char notes_dir[PATH_MAX];
     char addons_dir[PATH_MAX];
+    char config_path[PATH_MAX];
+    char favorites_path[PATH_MAX];
     char editor[INPUT_MAX];
+    char theme_name[64];
+    char sort_order[16];
 } AppConfig;
 
 typedef struct {
@@ -112,6 +116,7 @@ typedef struct {
     char filename[TITLE_MAX];
     char path[PATH_MAX];
     time_t mtime;
+    bool is_favorite;
 } Note;
 
 typedef struct {
@@ -420,6 +425,12 @@ static void init_paths(AppConfig *cfg) {
              editor && *editor ? editor : fallback_editor);
     snprintf(cfg->notes_dir, sizeof(cfg->notes_dir), "%s" PATH_SEP "notes", cfg->data_dir);
     snprintf(cfg->addons_dir, sizeof(cfg->addons_dir), "%s" PATH_SEP "addons", cfg->data_dir);
+    snprintf(cfg->config_path, sizeof(cfg->config_path), "%s" PATH_SEP "config", cfg->data_dir);
+    snprintf(cfg->favorites_path, sizeof(cfg->favorites_path), "%s" PATH_SEP "favorites", cfg->data_dir);
+
+    // Default settings
+    snprintf(cfg->theme_name, sizeof(cfg->theme_name), "default");
+    snprintf(cfg->sort_order, sizeof(cfg->sort_order), "mtime");
 
     // Initial setup diagnostics
     if (!ensure_dir(cfg->data_dir)) {
@@ -433,6 +444,187 @@ static void init_paths(AppConfig *cfg) {
     }
 }
 #endif
+
+/* ── themes ──────────────────────────────────────────────────────────────── */
+
+static void load_config(AppConfig *cfg) {
+    FILE *f = fopen(cfg->config_path, "r");
+    if (!f) return;
+
+    char line[INPUT_MAX];
+    while (fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+            line[--len] = '\0';
+        }
+
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+
+        *eq = '\0';
+        char *key = line;
+        char *value = eq + 1;
+
+        // Trim leading/trailing whitespace
+        while (*key && isspace((unsigned char)*key)) key++;
+        char *kend = key + strlen(key);
+        while (kend > key && isspace((unsigned char)kend[-1])) kend--;
+        *kend = '\0';
+
+        while (*value && isspace((unsigned char)*value)) value++;
+        char *vend = value + strlen(value);
+        while (vend > value && isspace((unsigned char)vend[-1])) vend--;
+        *vend = '\0';
+
+        if (!*key || !*value) continue;
+
+        if (strcmp(key, "editor") == 0) {
+            snprintf(cfg->editor, sizeof(cfg->editor), "%s", value);
+        } else if (strcmp(key, "theme") == 0) {
+            snprintf(cfg->theme_name, sizeof(cfg->theme_name), "%s", value);
+        } else if (strcmp(key, "sort") == 0) {
+            snprintf(cfg->sort_order, sizeof(cfg->sort_order), "%s", value);
+        }
+    }
+    fclose(f);
+}
+
+static void save_config(const AppConfig *cfg) {
+    FILE *f = fopen(cfg->config_path, "w");
+    if (!f) return;
+
+    fprintf(f, "editor = %s\n", cfg->editor);
+    fprintf(f, "theme = %s\n", cfg->theme_name);
+    fprintf(f, "sort = %s\n", cfg->sort_order);
+    fclose(f);
+}
+
+static void strip_ext(char *dst, size_t dst_size, const char *filename) {
+    snprintf(dst, dst_size, "%s", filename);
+    size_t len = strlen(dst);
+    if (len > 3 && strcmp(dst + len - 3, ".md") == 0) {
+        dst[len - 3] = '\0';
+    }
+}
+
+static void load_favorites_for_list(NoteList *list, const AppConfig *cfg) {
+    // Reset all favorite flags
+    for (size_t i = 0; i < list->count; i++) {
+        list->items[i].is_favorite = false;
+    }
+
+    FILE *f = fopen(cfg->favorites_path, "r");
+    if (!f) return;
+
+    char line[TITLE_MAX];
+    while (fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+            line[--len] = '\0';
+        }
+        if (!len) continue;
+
+        // Match against notes by filename
+        char stem[TITLE_MAX];
+        strip_ext(stem, sizeof(stem), line);
+        for (size_t i = 0; i < list->count; i++) {
+            char nstem[TITLE_MAX];
+            strip_ext(nstem, sizeof(nstem), list->items[i].filename);
+            if (strcmp(nstem, stem) == 0) {
+                list->items[i].is_favorite = true;
+                break;
+            }
+        }
+    }
+    fclose(f);
+}
+
+
+
+/* ── themes ──────────────────────────────────────────────────────────────── */
+
+typedef struct {
+    const char *name;
+    const char *title;
+    const char *selected;
+    const char *search;
+    const char *help;
+    const char *status;
+    const char *timestamp;
+    const char *pagination;
+} ThemePreset;
+
+static ThemePreset s_themes[] = {
+    {
+        .name = "default",
+        .title = "\x1b[36m",     // cyan
+        .selected = "\x1b[32m",  // green
+        .search = "\x1b[33m",    // yellow
+        .help = "\x1b[2m",       // dim
+        .status = "\x1b[31m",    // red
+        .timestamp = "\x1b[90m", // bright black
+        .pagination = "\x1b[90m",
+    },
+    {
+        .name = "dark",
+        .title = "\x1b[38;5;81m",   // soft blue
+        .selected = "\x1b[38;5;46m", // bright green
+        .search = "\x1b[38;5;220m",  // gold
+        .help = "\x1b[38;5;245m",    // grey
+        .status = "\x1b[38;5;196m",  // bright red
+        .timestamp = "\x1b[38;5;240m",
+        .pagination = "\x1b[38;5;240m",
+    },
+    {
+        .name = "light",
+        .title = "\x1b[34m",     // blue
+        .selected = "\x1b[32m",  // green
+        .search = "\x1b[33m",    // yellow
+        .help = "\x1b[90m",      // grey
+        .status = "\x1b[31m",    // red
+        .timestamp = "\x1b[2m",  // dim
+        .pagination = "\x1b[2m",
+    },
+    {
+        .name = "dracula",
+        .title = "\x1b[38;5;141m",  // purple
+        .selected = "\x1b[38;5;84m", // mint green
+        .search = "\x1b[38;5;215m",  // peach
+        .help = "\x1b[38;5;239m",    // dim grey
+        .status = "\x1b[38;5;203m",  // coral
+        .timestamp = "\x1b[38;5;242m",
+        .pagination = "\x1b[38;5;242m",
+    },
+    {
+        .name = "solarized",
+        .title = "\x1b[38;5;37m",   // teal
+        .selected = "\x1b[38;5;64m", // green
+        .search = "\x1b[38;5;136m",  // orange
+        .help = "\x1b[38;5;242m",    // grey
+        .status = "\x1b[38;5;160m",  // red
+        .timestamp = "\x1b[38;5;244m",
+        .pagination = "\x1b[38;5;244m",
+    },
+};
+
+static const size_t s_theme_count = sizeof(s_themes) / sizeof(s_themes[0]);
+
+static void load_theme(const AppConfig *cfg) {
+    // Find the named preset
+    for (size_t i = 0; i < s_theme_count; i++) {
+        if (strcmp(s_themes[i].name, cfg->theme_name) == 0) {
+            snprintf(g_theme.title, sizeof(g_theme.title), "%s", s_themes[i].title);
+            snprintf(g_theme.selected, sizeof(g_theme.selected), "%s", s_themes[i].selected);
+            snprintf(g_theme.search, sizeof(g_theme.search), "%s", s_themes[i].search);
+            snprintf(g_theme.help, sizeof(g_theme.help), "%s", s_themes[i].help);
+            snprintf(g_theme.status, sizeof(g_theme.status), "%s", s_themes[i].status);
+            snprintf(g_theme.timestamp, sizeof(g_theme.timestamp), "%s", s_themes[i].timestamp);
+            snprintf(g_theme.pagination, sizeof(g_theme.pagination), "%s", s_themes[i].pagination);
+            return;
+        }
+    }
+    // Fallback: keep default g_theme values (already initialized statically)
+}
 
 #ifndef _WIN32
 static bool has_md_extension(const char *name) {
@@ -460,6 +652,11 @@ static int note_cmp(const void *a, const void *b) {
     const Note *left = a;
     const Note *right = b;
 
+    // Favorites sort to the top
+    if (left->is_favorite && !right->is_favorite) return -1;
+    if (!left->is_favorite && right->is_favorite) return 1;
+
+    // Within each group, sort by mtime descending
     if (left->mtime < right->mtime) return 1;
     if (left->mtime > right->mtime) return -1;
     return strcmp(left->title, right->title);
@@ -782,8 +979,10 @@ static void render_ui(AppState *state) {
 
             char line[TITLE_MAX + 64];
             const char *prefix = i == state->selected ? g_theme.selected : "";
-            snprintf(line, sizeof(line), "%s> %s%-40s%s %s%s%s",
+            const char *star = state->notes.items[i].is_favorite ? "\x1b[33m\xe2\x98\x85\x1b[0m " : "  ";
+            snprintf(line, sizeof(line), "%s> %s%s%-38s%s %s%s%s",
                      prefix,
+                     star,
                      g_theme.title,
                      state->notes.items[i].title,
                      ANSI_RESET,
@@ -833,6 +1032,8 @@ static void render_ui(AppState *state) {
         snprintf(help_line, sizeof(help_line), "%s[t] trash bin%s", g_theme.help, ANSI_RESET);
         render_line(state, help_line);
         snprintf(help_line, sizeof(help_line), "%s[y] copy path%s", g_theme.help, ANSI_RESET);
+        render_line(state, help_line);
+        snprintf(help_line, sizeof(help_line), "%s[*] star%s", g_theme.help, ANSI_RESET);
         render_line(state, help_line);
         snprintf(help_line, sizeof(help_line), "%s[/] search%s", g_theme.help, ANSI_RESET);
         render_line(state, help_line);
@@ -1037,6 +1238,7 @@ static void create_note_flow(AppState *state, const AppConfig *cfg) {
 
     open_path_in_editor(state, cfg, path);
     load_notes(&state->notes, cfg);
+    load_favorites_for_list(&state->notes, cfg);
     normalize_selection(state);
 }
 
@@ -1070,6 +1272,7 @@ static void delete_note_flow(AppState *state, const AppConfig *cfg) {
     }
 
     load_notes(&state->notes, cfg);
+    load_favorites_for_list(&state->notes, cfg);
     state->selected = previous;
     normalize_selection(state);
 }
@@ -1096,6 +1299,7 @@ static void hard_delete_note_flow(AppState *state, const AppConfig *cfg) {
     }
 
     load_notes(&state->notes, cfg);
+    load_favorites_for_list(&state->notes, cfg);
     state->selected = previous;
     normalize_selection(state);
 }
@@ -1241,6 +1445,7 @@ static void trash_viewer_flow(AppState *state, const AppConfig *cfg) {
                 load_trash_notes(&trash, cfg);
                 if (sel > 0 && sel >= trash.count) sel = trash.count > 0 ? trash.count - 1 : 0;
                 load_notes(&state->notes, cfg);
+                load_favorites_for_list(&state->notes, cfg);
                 normalize_selection(state);
             }
         } else if (key.type == KEY_CHAR && key.ch == 'D') {
@@ -1289,6 +1494,7 @@ static void rename_note_flow(AppState *state, const AppConfig *cfg) {
     }
 
     load_notes(&state->notes, cfg);
+    load_favorites_for_list(&state->notes, cfg);
     normalize_selection(state);
 }
 
@@ -1350,6 +1556,45 @@ static void format_relative_time(time_t mtime, char *buf, size_t buf_size) {
 }
 
 
+static bool save_favorites_to_disk(const AppState *state, const AppConfig *cfg) {
+    FILE *f = fopen(cfg->favorites_path, "w");
+    if (!f) return false;
+
+    for (size_t i = 0; i < state->notes.count; i++) {
+        if (state->notes.items[i].is_favorite) {
+            fprintf(f, "%s\n", state->notes.items[i].filename);
+        }
+    }
+    fclose(f);
+    return true;
+}
+
+static void toggle_favorite(AppState *state, const AppConfig *cfg) {
+    if (state->notes.count == 0 || !selected_is_visible(state)) return;
+
+    size_t idx = state->selected;
+    bool now_fav = !state->notes.items[idx].is_favorite;
+    state->notes.items[idx].is_favorite = now_fav;
+    save_favorites_to_disk(state, cfg);
+
+    // Save the filename explicitly before sort
+    char filename[TITLE_MAX];
+    snprintf(filename, sizeof(filename), "%s", state->notes.items[idx].filename);
+    const char *title = state->notes.items[idx].title;
+
+    snprintf(state->status, sizeof(state->status), "%s \"%s\"", now_fav ? "Starred" : "Unstarred", title);
+
+    // Re-sort notes since favorites may have changed
+    qsort(state->notes.items, state->notes.count, sizeof(*state->notes.items), note_cmp);
+
+    // Find the selected note again after sorting
+    for (size_t i = 0; i < state->notes.count; i++) {
+        if (strcmp(state->notes.items[i].filename, filename) == 0) {
+            state->selected = i;
+            break;
+        }
+    }
+}
 
 static void handle_search_key(AppState *state, KeyEvent key) {
     size_t len = strlen(state->search);
@@ -1512,7 +1757,7 @@ static void set_plugin_disabled_on_disk(const AppConfig *cfg, const char *name, 
 }
 
 static bool key_is_core_reserved(char key) {
-    const char *reserved = "nrdDty/p:q";
+    const char *reserved = "nrdDty*/p:q";
     return key && (strchr(reserved, key) != NULL || key == '\r' || key == '\n');
 }
 
@@ -2314,6 +2559,7 @@ static void open_selected_note(AppState *state, const AppConfig *cfg) {
     fflush(stdout);
 
     load_notes(&state->notes, cfg);
+    load_favorites_for_list(&state->notes, cfg);
     normalize_selection(state);
 }
 
@@ -2341,6 +2587,7 @@ static bool run_named_plugin(AppState *state, const AppConfig *cfg, const char *
             }
             plugin_list_free(&plugins);
             load_notes(&state->notes, cfg);
+            load_favorites_for_list(&state->notes, cfg);
             normalize_selection(state);
             return true;
         }
@@ -2548,6 +2795,9 @@ static void handle_key(AppState *state, const AppConfig *cfg, KeyEvent key) {
     case 'y':
         copy_path_to_clipboard(state, cfg);
         break;
+    case '*':
+        toggle_favorite(state, cfg);
+        break;
     case '/':
         state->search_mode = true;
         state->search[0] = '\0';
@@ -2618,10 +2868,13 @@ int main(void) {
     state.running = true;
 
     init_paths(&cfg);
+    load_config(&cfg);
+    load_theme(&cfg);
     if (!load_notes(&state.notes, &cfg)) {
         fprintf(stderr, "blob: failed to load notes\n");
         return 1;
     }
+    load_favorites_for_list(&state.notes, &cfg);
 
     ui_loop(&state, &cfg);
     note_list_free(&state.notes);
