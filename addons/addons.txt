@@ -9,3 +9,4 @@ word-count
 open-dir
 export
 remind
+themes
