@@ -63,21 +63,54 @@ static int read_key(void) {
     return c;
 }
 #else
+#include <signal.h>
 #include <termios.h>
 #include <sys/select.h>
 
 static struct termios orig;
+static volatile sig_atomic_t g_raw_enabled = 0;
+
+static volatile sig_atomic_t g_signal_received = 0;
+
+static void signal_handler(int sig) {
+    (void)sig;
+    if (g_signal_received) return;
+    g_signal_received = 1;
+
+    // Async-signal-safe terminal cleanup
+    if (g_raw_enabled) {
+        static const char restore[] = "\x1b[?25h\x1b[0m";
+        write(STDOUT_FILENO, restore, sizeof(restore) - 1);
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig);
+    }
+    _exit(128 + sig);
+}
+
+static void setup_signal_handlers(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+}
 
 static void enable_raw_mode(void) {
     tcgetattr(STDIN_FILENO, &orig);
     struct termios raw = orig;
-    raw.c_lflag &= (tcflag_t)~(ECHO | ICANON);
+    raw.c_iflag &= (tcflag_t)~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON);
+    raw.c_lflag &= (tcflag_t)~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
+    raw.c_cflag &= (tcflag_t)~(PARENB);
+    raw.c_cflag |= CS8;
     raw.c_cc[VMIN] = 1;
     raw.c_cc[VTIME] = 0;
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
+    g_raw_enabled = 1;
 }
 
 static void disable_raw_mode(void) {
+    if (!g_raw_enabled) return;
+    g_raw_enabled = 0;
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig);
 }
 
@@ -92,7 +125,7 @@ static int read_key(void) {
         FD_ZERO(&set);
         FD_SET(STDIN_FILENO, &set);
         tv.tv_sec = 0;
-        tv.tv_usec = 30000;
+        tv.tv_usec = 200000;
 
         if (select(STDIN_FILENO + 1, &set, NULL, NULL, &tv) <= 0 ||
             read(STDIN_FILENO, &seq[0], 1) != 1) {
@@ -102,7 +135,7 @@ static int read_key(void) {
         FD_ZERO(&set);
         FD_SET(STDIN_FILENO, &set);
         tv.tv_sec = 0;
-        tv.tv_usec = 30000;
+        tv.tv_usec = 200000;
 
         if (select(STDIN_FILENO + 1, &set, NULL, NULL, &tv) <= 0 ||
             read(STDIN_FILENO, &seq[1], 1) != 1) {
@@ -128,22 +161,42 @@ static void clear_screen(void) {
 
 static void render_list(size_t sel, size_t count, const char **names,
                         const char **descs) {
-    printf("\033[?25l");
-    printf("╔═ blob theme selector ═════════════════════╗\n");
-    printf("║                                            ║\n");
+#define BOX_W 60
+    printf("\033[?25l");    // Top border: ╔═══ blob theme selector ══...══╗
+    printf("╔═══ blob theme selector ");
+    for (int i = 0; i < BOX_W - 26; i++) printf("═");
+    printf("╗\n");
+
+    // Spacer
+    printf("║%*s║\n", BOX_W - 2, "");
+
     for (size_t i = 0; i < count; i++) {
-        if (i == sel) {
-            printf("║  \033[1;32m→ %-20s\033[0m  \033[2m%s\033[0m     ║\n",
-                   names[i], descs[i]);
+        // Truncate description to 30 chars for alignment
+        char desc_buf[32];
+        size_t dlen = strlen(descs[i]);
+        if (dlen > 30) {
+            memcpy(desc_buf, descs[i], 30);
+            desc_buf[30] = '\0';
         } else {
-            printf("║    %-20s  \033[2m%s\033[0m     ║\n",
-                   names[i], descs[i]);
+            snprintf(desc_buf, sizeof(desc_buf), "%s", descs[i]);
+        }
+        if (i == sel) {
+            printf("║  \033[1;32m→ %-20s\033[0m  \033[2m%-30s\033[0m  ║\n",
+                   names[i], desc_buf);
+        } else {
+            printf("║    %-20s  \033[2m%-30s\033[0m  ║\n",
+                   names[i], desc_buf);
         }
     }
-    printf("║                                            ║\n");
-    printf("╚════════════════════════════════════════════╝\n");
+
+    // Bottom border
+    printf("╚");
+    for (int i = 0; i < BOX_W - 2; i++) printf("═");
+    printf("╝\n");
+
     printf("\n\033[2m↑/↓ navigate  ENTER select  ESC cancel\033[0m\n");
     fflush(stdout);
+#undef BOX_W
 }
 
 int main(int argc, char **argv) {
@@ -216,6 +269,13 @@ int main(int argc, char **argv) {
         }
         fclose(cf);
     }
+
+    atexit(disable_raw_mode);
+#ifndef _WIN32
+    setup_signal_handlers();
+#endif
+
+    enable_raw_mode();
 
     clear_screen();
     printf("Current theme: \033[1m%s\033[0m\n\n", current_theme);
