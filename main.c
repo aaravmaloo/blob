@@ -2,11 +2,12 @@
 
 #define _DEFAULT_SOURCE
 
-#define BLOB_VERSION "1.2.0"
+#define BLOB_VERSION "1.2.1"
 
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -146,7 +147,8 @@ typedef enum {
     KEY_LEFT,
     KEY_RIGHT,
     KEY_CTRL_P,
-    KEY_CTRL_R
+    KEY_CTRL_R,
+    KEY_CTRL_C
 } KeyType;
 
 typedef struct {
@@ -228,8 +230,11 @@ static void enable_raw_mode(void) {
     tcgetattr(STDIN_FILENO, &original_termios);
 
     struct termios raw = original_termios;
-    raw.c_lflag &= (tcflag_t) ~(ECHO | ICANON);
-    raw.c_iflag &= (tcflag_t) ~(IXON | ICRNL);
+    raw.c_iflag &= (tcflag_t)~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL | IXON);
+    raw.c_oflag &= (tcflag_t)~(OPOST);
+    raw.c_lflag &= (tcflag_t)~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
+    raw.c_cflag &= (tcflag_t)~(PARENB);
+    raw.c_cflag |= CS8;
     raw.c_cc[VMIN] = 1;
     raw.c_cc[VTIME] = 0;
 
@@ -242,8 +247,43 @@ static void enable_raw_mode(void) {
 }
 
 #ifndef BLOB_TEST
+static volatile sig_atomic_t g_signal_received = 0;
+
+static void signal_handler(int sig) {
+    (void)sig;
+    if (g_signal_received) return;
+    g_signal_received = 1;
+
+    // Async-signal-safe terminal cleanup: only use write() and tcsetattr()
+    static const char restore[] = "\x1b[?25h\x1b[0m\x1b[?1049l";
+    write(STDOUT_FILENO, restore, sizeof(restore) - 1);
+
+#ifndef _WIN32
+    // Restore original terminal settings (async-signal-safe)
+    tcsetattr(STDIN_FILENO, TCSAFLUSH, &original_termios);
+#endif
+
+    _exit(128 + sig);
+}
+
 static void restore_terminal_at_exit(void) {
     disable_raw_mode();
+}
+
+static void setup_signal_handlers(void) {
+#ifndef _WIN32
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
+#else
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+#endif
 }
 #endif
 
@@ -271,6 +311,10 @@ static KeyEvent read_key(void) {
     }
     if (c == 18) {
         key.type = KEY_CTRL_R;
+        return key;
+    }
+    if (c == 3) {
+        key.type = KEY_CTRL_C;
         return key;
     }
     if (c == 0 || c == 224) {
@@ -307,6 +351,10 @@ static KeyEvent read_key(void) {
         key.type = KEY_CTRL_R;
         return key;
     }
+    if (c == 3) {
+        key.type = KEY_CTRL_C;
+        return key;
+    }
     if (c == '\x1b') {
         char seq[2];
 
@@ -315,7 +363,7 @@ static KeyEvent read_key(void) {
         FD_ZERO(&set);
         FD_SET(STDIN_FILENO, &set);
         timeout.tv_sec = 0;
-        timeout.tv_usec = 30000;
+        timeout.tv_usec = 100000;
 
         if (select(STDIN_FILENO + 1, &set, NULL, NULL, &timeout) <= 0 ||
             read(STDIN_FILENO, &seq[0], 1) != 1) {
@@ -326,7 +374,7 @@ static KeyEvent read_key(void) {
         FD_ZERO(&set);
         FD_SET(STDIN_FILENO, &set);
         timeout.tv_sec = 0;
-        timeout.tv_usec = 30000;
+        timeout.tv_usec = 100000;
 
         if (select(STDIN_FILENO + 1, &set, NULL, NULL, &timeout) <= 0 ||
             read(STDIN_FILENO, &seq[1], 1) != 1) {
@@ -939,7 +987,7 @@ static size_t first_rendered_note(const AppState *state) {
 }
 
 static void render_line(AppState *state, const char *text) {
-    printf(ANSI_CLEAR_LINE "%s\n", text);
+    printf("\r" ANSI_CLEAR_LINE "%s\n", text);
     state->rendered_lines++;
 }
 
@@ -1082,7 +1130,7 @@ static bool prompt_confirm(AppState *state, const char *message) {
 
     KeyEvent key = read_key();
     bool confirmed = key.type == KEY_CHAR && (key.ch == 'y' || key.ch == 'Y');
-    printf("%s\n", confirmed ? " y" : " N");
+    printf("\r%s\n", confirmed ? " y" : " N");
     fflush(stdout);
     return confirmed;
 }
@@ -1527,8 +1575,27 @@ static void copy_path_to_clipboard(AppState *state, const AppConfig *cfg) {
 
     enable_raw_mode();
 #else
-    char cmd[PATH_MAX + 64];
-    snprintf(cmd, sizeof(cmd), "printf '%s' | xclip -selection clipboard 2>/dev/null || printf '%s' | xsel -b 2>/dev/null || printf '%s' | pbcopy 2>/dev/null", selected.path, selected.path, selected.path);
+    // Escape single quotes in path for safe shell usage
+    char safe_path[PATH_MAX * 2];
+    size_t spi = 0;
+    for (size_t i = 0; selected.path[i] && spi + 4 < sizeof(safe_path); i++) {
+        if (selected.path[i] == '\'') {
+            safe_path[spi++] = '\'';
+            safe_path[spi++] = '\\';
+            safe_path[spi++] = '\'';
+            safe_path[spi++] = '\'';
+        } else {
+            safe_path[spi++] = selected.path[i];
+        }
+    }
+    safe_path[spi] = '\0';
+
+    char cmd[PATH_MAX * 2 + 128];
+    snprintf(cmd, sizeof(cmd),
+        "printf '%%s' '%s' | xclip -selection clipboard 2>/dev/null || "
+        "printf '%%s' '%s' | xsel -b 2>/dev/null || "
+        "printf '%%s' '%s' | pbcopy 2>/dev/null",
+        safe_path, safe_path, safe_path);
     if (system(cmd) == 0) {
         snprintf(state->status, sizeof(state->status), "Copied path to clipboard");
     } else {
@@ -1998,9 +2065,9 @@ static void fetch_remote_plugins(AppState *state, const AppConfig *cfg, PluginLi
         printf("Error: failed to fetch remote plugins (network error or curl missing).\n");
         printf("Press any key to continue...");
         fflush(stdout);
+        enable_raw_mode();
         read_key();
         exit_alt_screen();
-        enable_raw_mode();
         return;
     }
 
@@ -2139,9 +2206,9 @@ static bool compile_plugin(AppState *state, const AppConfig *cfg, Plugin *plugin
             printf("Dest: %s\n", new_c);
             printf("Press any key to continue...");
             fflush(stdout);
+            enable_raw_mode();
             read_key();
             exit_alt_screen();
-            enable_raw_mode();
             return false;
         }
 
@@ -2173,9 +2240,9 @@ static bool compile_plugin(AppState *state, const AppConfig *cfg, Plugin *plugin
         if (system(cmd) != 0) {
             printf("Error: failed to download C source file.\nPress any key to continue...");
             fflush(stdout);
+            enable_raw_mode();
             read_key();
             exit_alt_screen();
-            enable_raw_mode();
             return false;
         }
 
@@ -2200,19 +2267,19 @@ static bool compile_plugin(AppState *state, const AppConfig *cfg, Plugin *plugin
         printf("Make sure a C compiler (gcc/cc) is installed and in your PATH.\n");
         printf("Press any key to continue...");
         fflush(stdout);
+        enable_raw_mode();
         read_key();
         exit_alt_screen();
-        enable_raw_mode();
         return false;
     }
 
     printf("Successfully compiled and installed: %s\n", plugin->name);
     printf("Press any key to continue...");
     fflush(stdout);
+    enable_raw_mode();
     read_key();
 
     exit_alt_screen();
-    enable_raw_mode();
 
     plugin->is_compiled = true;
     plugin->is_remote = false;
@@ -2245,10 +2312,10 @@ static void delete_plugin(AppState *state, const AppConfig *cfg, PluginList *lis
 
     printf("Plugin uninstalled.\nPress any key to continue...");
     fflush(stdout);
+    enable_raw_mode();
     read_key();
 
     exit_alt_screen();
-    enable_raw_mode();
 
     plugin->is_compiled = false;
     plugin->update_available = false;
@@ -2307,6 +2374,7 @@ static void run_plugin_on_target(AppState *state, const Plugin *plugin, const ch
     if (!run_plugin_process(plugin->exe_path, target_path)) {
         printf("\nPlugin execution failed.\nPress any key to continue...");
         fflush(stdout);
+        enable_raw_mode();
         read_key();
     }
 
@@ -2755,6 +2823,11 @@ static void handle_key(AppState *state, const AppConfig *cfg, KeyEvent key) {
         return;
     }
 
+    if (key.type == KEY_CTRL_C) {
+        state->running = false;
+        return;
+    }
+
     if (state->search_mode) {
         if (key.type == KEY_CHAR && key.ch == 'q') {
             state->running = false;
@@ -2859,6 +2932,7 @@ int main(void) {
 #endif
 
     atexit(restore_terminal_at_exit);
+    setup_signal_handlers();
 
     AppConfig cfg;
     AppState state;
@@ -2874,9 +2948,9 @@ int main(void) {
         fprintf(stderr, "blob: failed to load notes\n");
         return 1;
     }
-    load_favorites_for_list(&state.notes, &cfg);
+    load_favorites_for_list(&state.notes, &cfg);    ui_loop(&state, &cfg);
 
-    ui_loop(&state, &cfg);
+    exit_alt_screen();
     note_list_free(&state.notes);
     return 0;
 }
