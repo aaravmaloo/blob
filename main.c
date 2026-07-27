@@ -2,7 +2,7 @@
 
 #define _DEFAULT_SOURCE
 
-#define BLOB_VERSION "1.2.1"
+#define BLOB_VERSION "1.3.0"
 
 #include <ctype.h>
 #include <errno.h>
@@ -62,6 +62,20 @@
 #define TITLE_MAX 256
 #define INITIAL_NOTES_CAP 32
 #define VISIBLE_NOTES 12
+#define MAX_UNDO 1
+
+typedef enum {
+    UNDO_NONE = 0,
+    UNDO_TRASH,
+    UNDO_RENAME
+} UndoType;
+
+typedef struct {
+    UndoType type;
+    char current_path[PATH_MAX];
+    char target_path[PATH_MAX];
+    char title[TITLE_MAX];
+} UndoAction;
 
 #define ANSI_RESET "\x1b[0m"
 #define ANSI_BOLD "\x1b[1m"
@@ -110,6 +124,21 @@ typedef struct {
     char editor[INPUT_MAX];
     char theme_name[64];
     char sort_order[16];
+    // Configurable keybindings (defaults set in init_paths)
+    char key_create;
+    char key_rename;
+    char key_trash;
+    char key_delete;
+    char key_trash_bin;
+    char key_copy;
+    char key_star;
+    char key_search;
+    char key_cmd;
+    char key_plugins;
+    char key_quit;
+    char key_undo;
+    char key_move_down;
+    char key_move_up;
 } AppConfig;
 
 typedef struct {
@@ -132,8 +161,10 @@ typedef struct {
     char search[SEARCH_MAX];
     bool search_mode;
     bool running;
+    bool show_help_expanded;
     size_t rendered_lines;
     char status[INPUT_MAX];
+    UndoAction undo;
 } AppState;
 
 typedef enum {
@@ -148,7 +179,11 @@ typedef enum {
     KEY_RIGHT,
     KEY_CTRL_P,
     KEY_CTRL_R,
-    KEY_CTRL_C
+    KEY_CTRL_C,
+    KEY_CTRL_S,
+    KEY_CTRL_D,
+    KEY_CTRL_K,
+    KEY_CTRL_O
 } KeyType;
 
 typedef struct {
@@ -317,6 +352,22 @@ static KeyEvent read_key(void) {
         key.type = KEY_CTRL_C;
         return key;
     }
+    if (c == 19) {
+        key.type = KEY_CTRL_S;
+        return key;
+    }
+    if (c == 4) {
+        key.type = KEY_CTRL_D;
+        return key;
+    }
+    if (c == 11) {
+        key.type = KEY_CTRL_K;
+        return key;
+    }
+    if (c == 15) {
+        key.type = KEY_CTRL_O;
+        return key;
+    }
     if (c == 0 || c == 224) {
         int ext = _getch();
         if (ext == 72) key.type = KEY_UP;
@@ -353,6 +404,22 @@ static KeyEvent read_key(void) {
     }
     if (c == 3) {
         key.type = KEY_CTRL_C;
+        return key;
+    }
+    if (c == 19) {
+        key.type = KEY_CTRL_S;
+        return key;
+    }
+    if (c == 4) {
+        key.type = KEY_CTRL_D;
+        return key;
+    }
+    if (c == 11) {
+        key.type = KEY_CTRL_K;
+        return key;
+    }
+    if (c == 15) {
+        key.type = KEY_CTRL_O;
         return key;
     }
     if (c == '\x1b') {
@@ -480,6 +547,22 @@ static void init_paths(AppConfig *cfg) {
     snprintf(cfg->theme_name, sizeof(cfg->theme_name), "default");
     snprintf(cfg->sort_order, sizeof(cfg->sort_order), "mtime");
 
+    // Default keybindings
+    cfg->key_create = 'n';
+    cfg->key_rename = 'r';
+    cfg->key_trash = 'd';
+    cfg->key_delete = 'D';
+    cfg->key_trash_bin = 't';
+    cfg->key_copy = 'y';
+    cfg->key_star = '*';
+    cfg->key_search = '/';
+    cfg->key_cmd = ':';
+    cfg->key_plugins = 'p';
+    cfg->key_quit = 'q';
+    cfg->key_undo = 'u';
+    cfg->key_move_down = 'j';
+    cfg->key_move_up = 'k';
+
     // Initial setup diagnostics
     if (!ensure_dir(cfg->data_dir)) {
         fprintf(stderr, "Warning: could not ensure data_dir: %s\n", cfg->data_dir);
@@ -532,6 +615,23 @@ static void load_config(AppConfig *cfg) {
             snprintf(cfg->theme_name, sizeof(cfg->theme_name), "%s", value);
         } else if (strcmp(key, "sort") == 0) {
             snprintf(cfg->sort_order, sizeof(cfg->sort_order), "%s", value);
+        } else if (strncmp(key, "key_", 4) == 0) {
+            if (value[0]) {
+                if (strcmp(key + 4, "create") == 0) cfg->key_create = value[0];
+                else if (strcmp(key + 4, "rename") == 0) cfg->key_rename = value[0];
+                else if (strcmp(key + 4, "trash") == 0) cfg->key_trash = value[0];
+                else if (strcmp(key + 4, "delete") == 0) cfg->key_delete = value[0];
+                else if (strcmp(key + 4, "trash_bin") == 0) cfg->key_trash_bin = value[0];
+                else if (strcmp(key + 4, "copy") == 0) cfg->key_copy = value[0];
+                else if (strcmp(key + 4, "star") == 0) cfg->key_star = value[0];
+                else if (strcmp(key + 4, "search") == 0) cfg->key_search = value[0];
+                else if (strcmp(key + 4, "cmd") == 0) cfg->key_cmd = value[0];
+                else if (strcmp(key + 4, "plugins") == 0) cfg->key_plugins = value[0];
+                else if (strcmp(key + 4, "quit") == 0) cfg->key_quit = value[0];
+                else if (strcmp(key + 4, "undo") == 0) cfg->key_undo = value[0];
+                else if (strcmp(key + 4, "move_down") == 0) cfg->key_move_down = value[0];
+                else if (strcmp(key + 4, "move_up") == 0) cfg->key_move_up = value[0];
+            }
         }
     }
     fclose(f);
@@ -544,6 +644,20 @@ static void save_config(const AppConfig *cfg) {
     fprintf(f, "editor = %s\n", cfg->editor);
     fprintf(f, "theme = %s\n", cfg->theme_name);
     fprintf(f, "sort = %s\n", cfg->sort_order);
+    fprintf(f, "key_create = %c\n", cfg->key_create);
+    fprintf(f, "key_rename = %c\n", cfg->key_rename);
+    fprintf(f, "key_trash = %c\n", cfg->key_trash);
+    fprintf(f, "key_delete = %c\n", cfg->key_delete);
+    fprintf(f, "key_trash_bin = %c\n", cfg->key_trash_bin);
+    fprintf(f, "key_copy = %c\n", cfg->key_copy);
+    fprintf(f, "key_star = %c\n", cfg->key_star);
+    fprintf(f, "key_search = %c\n", cfg->key_search);
+    fprintf(f, "key_cmd = %c\n", cfg->key_cmd);
+    fprintf(f, "key_plugins = %c\n", cfg->key_plugins);
+    fprintf(f, "key_quit = %c\n", cfg->key_quit);
+    fprintf(f, "key_undo = %c\n", cfg->key_undo);
+    fprintf(f, "key_move_down = %c\n", cfg->key_move_down);
+    fprintf(f, "key_move_up = %c\n", cfg->key_move_up);
     fclose(f);
 }
 
@@ -994,7 +1108,8 @@ static void render_line(AppState *state, const char *text) {
 static void format_relative_time(time_t mtime, char *buf, size_t buf_size);
 
 #ifndef BLOB_TEST
-static void render_ui(AppState *state) {
+static void render_plugin_keybinds_help(AppState *state, const AppConfig *cfg);
+static void render_ui(AppState *state, const AppConfig *cfg) {
     normalize_selection(state);
     clear_owned_region(state);
 
@@ -1064,35 +1179,51 @@ static void render_ui(AppState *state) {
         render_line(state, help_line);
         snprintf(help_line, sizeof(help_line), "%s[ESC] clear search%s", g_theme.help, ANSI_RESET);
         render_line(state, help_line);
-        snprintf(help_line, sizeof(help_line), "%s[q] quit%s", g_theme.help, ANSI_RESET);
+        snprintf(help_line, sizeof(help_line), "%s[%c] quit%s", g_theme.help, cfg->key_quit, ANSI_RESET);
         render_line(state, help_line);
     } else {
-        snprintf(help_line, sizeof(help_line), "%s[ENTER] open%s", g_theme.help, ANSI_RESET);
-        render_line(state, help_line);
-        snprintf(help_line, sizeof(help_line), "%s[n] new%s", g_theme.help, ANSI_RESET);
-        render_line(state, help_line);
-        snprintf(help_line, sizeof(help_line), "%s[r] rename%s", g_theme.help, ANSI_RESET);
-        render_line(state, help_line);
-        snprintf(help_line, sizeof(help_line), "%s[d] trash%s", g_theme.help, ANSI_RESET);
-        render_line(state, help_line);
-        snprintf(help_line, sizeof(help_line), "%s[D] delete%s", g_theme.help, ANSI_RESET);
-        render_line(state, help_line);
-        snprintf(help_line, sizeof(help_line), "%s[t] trash bin%s", g_theme.help, ANSI_RESET);
-        render_line(state, help_line);
-        snprintf(help_line, sizeof(help_line), "%s[y] copy path%s", g_theme.help, ANSI_RESET);
-        render_line(state, help_line);
-        snprintf(help_line, sizeof(help_line), "%s[*] star%s", g_theme.help, ANSI_RESET);
-        render_line(state, help_line);
-        snprintf(help_line, sizeof(help_line), "%s[/] search%s", g_theme.help, ANSI_RESET);
-        render_line(state, help_line);
-        snprintf(help_line, sizeof(help_line), "%s[:] command%s", g_theme.help, ANSI_RESET);
-        render_line(state, help_line);
-        snprintf(help_line, sizeof(help_line), "%s[p] plugins%s", g_theme.help, ANSI_RESET);
-        render_line(state, help_line);
-        snprintf(help_line, sizeof(help_line), "%s[Ctrl+R] reminders%s", g_theme.help, ANSI_RESET);
-        render_line(state, help_line);
-        snprintf(help_line, sizeof(help_line), "%s[q] quit%s", g_theme.help, ANSI_RESET);
-        render_line(state, help_line);
+        if (state->show_help_expanded) {
+            /* ── Core keybinds ── */
+            snprintf(help_line, sizeof(help_line), "%s─── %sCore%s ───", g_theme.help, g_theme.title, ANSI_RESET);
+            render_line(state, help_line);
+            snprintf(help_line, sizeof(help_line), "%s[%c] new  [%c] rename  [%c] trash  [%c] delete%s", g_theme.help,
+                     cfg->key_create, cfg->key_rename, cfg->key_trash, cfg->key_delete, ANSI_RESET);
+            render_line(state, help_line);
+            snprintf(help_line, sizeof(help_line), "%s[%c] bin  [%c] copy  [%c] star  [%c] search%s", g_theme.help,
+                     cfg->key_trash_bin, cfg->key_copy, cfg->key_star, cfg->key_search, ANSI_RESET);
+            render_line(state, help_line);
+            snprintf(help_line, sizeof(help_line), "%s[%c] cmd  [%c] plugins  [%c] undo  [%c/%c] nav  [%c] quit%s", g_theme.help,
+                     cfg->key_cmd, cfg->key_plugins, cfg->key_undo,
+                     cfg->key_move_up, cfg->key_move_down, cfg->key_quit, ANSI_RESET);
+            render_line(state, help_line);
+
+            /* ── Ctrl shortcuts ── */
+            snprintf(help_line, sizeof(help_line), "%s─── %sCtrl%s ───", g_theme.help, g_theme.title, ANSI_RESET);
+            render_line(state, help_line);
+            snprintf(help_line, sizeof(help_line), "%s[Ctrl+R] remind  [Ctrl+K] change keys  [Ctrl+O] less%s", g_theme.help, ANSI_RESET);
+            render_line(state, help_line);
+
+            /* ── Plugin keybinds ── */
+            render_plugin_keybinds_help(state, cfg);
+        } else {
+            /* Show 4 action keybinding lines (one per line) + core keys */
+            snprintf(help_line, sizeof(help_line), "%s[%c/%c] navigate%s", g_theme.help,
+                     cfg->key_move_up, cfg->key_move_down, ANSI_RESET);
+            render_line(state, help_line);
+            snprintf(help_line, sizeof(help_line), "%s[%c] new%s", g_theme.help, cfg->key_create, ANSI_RESET);
+            render_line(state, help_line);
+            snprintf(help_line, sizeof(help_line), "%s[%c] rename%s", g_theme.help, cfg->key_rename, ANSI_RESET);
+            render_line(state, help_line);
+            snprintf(help_line, sizeof(help_line), "%s[%c] trash  [%c] delete%s", g_theme.help,
+                     cfg->key_trash, cfg->key_delete, ANSI_RESET);
+            render_line(state, help_line);
+            snprintf(help_line, sizeof(help_line), "%s[%c] bin  [%c] search%s", g_theme.help,
+                     cfg->key_trash_bin, cfg->key_search, ANSI_RESET);
+            render_line(state, help_line);
+            snprintf(help_line, sizeof(help_line), "%s[Ctrl+O] more  [Ctrl+R] remind  [Ctrl+K] keys  [%c] quit%s", g_theme.help,
+                     cfg->key_quit, ANSI_RESET);
+            render_line(state, help_line);
+        }
     }
 
     if (state->status[0]) {
@@ -1314,10 +1445,18 @@ static void delete_note_flow(AppState *state, const AppConfig *cfg) {
     unique_path_in_dir(trash_dir, selected.filename, trash_path, sizeof(trash_path));
 
     size_t previous = state->selected;
+    state->undo.type = UNDO_TRASH;
+    snprintf(state->undo.current_path, sizeof(state->undo.current_path), "%s", trash_path);
+    snprintf(state->undo.target_path, sizeof(state->undo.target_path), "%s", selected.path);
+    snprintf(state->undo.title, sizeof(state->undo.title), "%s", selected.title);
+
     if (rename(selected.path, trash_path) != 0) {
         snprintf(state->status, sizeof(state->status), "failed to trash note: %s", strerror(errno));
+        state->undo.type = UNDO_NONE;
         return;
     }
+
+    snprintf(state->status, sizeof(state->status), "Trashed \"%s\" (press %c to undo)", selected.title, cfg->key_undo);
 
     load_notes(&state->notes, cfg);
     load_favorites_for_list(&state->notes, cfg);
@@ -1536,10 +1675,18 @@ static void rename_note_flow(AppState *state, const AppConfig *cfg) {
     sanitize_slug(new_title, slug, sizeof(slug));
     unique_note_path(cfg, slug, new_path, sizeof(new_path));
 
+    state->undo.type = UNDO_RENAME;
+    snprintf(state->undo.current_path, sizeof(state->undo.current_path), "%s", new_path);
+    snprintf(state->undo.target_path, sizeof(state->undo.target_path), "%s", selected.path);
+    snprintf(state->undo.title, sizeof(state->undo.title), "%s", selected.title);
+
     if (rename(selected.path, new_path) != 0) {
         snprintf(state->status, sizeof(state->status), "failed to rename note: %s", strerror(errno));
+        state->undo.type = UNDO_NONE;
         return;
     }
+
+    snprintf(state->status, sizeof(state->status), "Renamed (press %c to undo)", cfg->key_undo);
 
     load_notes(&state->notes, cfg);
     load_favorites_for_list(&state->notes, cfg);
@@ -1824,8 +1971,70 @@ static void set_plugin_disabled_on_disk(const AppConfig *cfg, const char *name, 
 }
 
 static bool key_is_core_reserved(char key) {
-    const char *reserved = "nrdDty*/p:q";
+    const char *reserved = "nrdDty*/p:qujk";
     return key && (strchr(reserved, key) != NULL || key == '\r' || key == '\n');
+}
+
+/* ── plugin keybind overrides ─────────────────────────────────────────── */
+
+static char get_plugin_keybind_override(const AppConfig *cfg, const char *name) {
+    char path[PATH_MAX + 64];
+    snprintf(path, sizeof(path), "%s" PATH_SEP "plugin_keybinds", cfg->data_dir);
+    FILE *f = fopen(path, "r");
+    if (!f) return '\0';
+    char line[PLUGIN_NAME_MAX + 16];
+    while (fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        if (strcmp(line, name) == 0 && eq[1]) {
+            fclose(f);
+            return eq[1];
+        }
+    }
+    fclose(f);
+    return '\0';
+}
+
+static void set_plugin_keybind_override(const AppConfig *cfg, const char *name, char keybind) {
+    char path[PATH_MAX + 64];
+    snprintf(path, sizeof(path), "%s" PATH_SEP "plugin_keybinds", cfg->data_dir);
+
+    char entries[64][PLUGIN_NAME_MAX + 4];
+    size_t count = 0;
+
+    // Read existing entries, filter out the one we're changing
+    FILE *f = fopen(path, "r");
+    if (f) {
+        char line[PLUGIN_NAME_MAX + 16];
+        while (fgets(line, sizeof(line), f) && count < 64) {
+            size_t len = strlen(line);
+            while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
+            char *eq = strchr(line, '=');
+            if (eq) *eq = '\0';
+            if (line[0] && strcmp(line, name) != 0) {
+                size_t out = strlen(line);
+                snprintf(line + out, sizeof(line) - out, "=%s", eq ? eq + 1 : "");
+                snprintf(entries[count++], sizeof(entries[0]), "%s", line);
+            }
+        }
+        fclose(f);
+    }
+
+    // Add or update this plugin's entry
+    if (keybind && count < 64) {
+        snprintf(entries[count++], sizeof(entries[0]), "%s=%c", name, keybind);
+    }
+
+    f = fopen(path, "w");
+    if (f) {
+        for (size_t i = 0; i < count; i++) {
+            fprintf(f, "%s\n", entries[i]);
+        }
+        fclose(f);
+    }
 }
 
 static bool plugin_uses_workspace(const Plugin *plugin) {
@@ -2008,8 +2217,13 @@ static void scan_addons_dir(PluginList *list, const AppConfig *cfg, const char *
 #endif
 }
 
-static void mark_plugin_keybind_conflicts(PluginList *list) {
+static void mark_plugin_keybind_conflicts(PluginList *list, const AppConfig *cfg) {
     for (size_t i = 0; i < list->count; i++) {
+        // Check for a per-plugin keybind override first
+        char override = cfg ? get_plugin_keybind_override(cfg, list->items[i].name) : '\0';
+        if (override) {
+            list->items[i].keybind = override;
+        }
         list->items[i].has_keybind_conflict = key_is_core_reserved(list->items[i].keybind);
     }
 
@@ -2023,6 +2237,57 @@ static void mark_plugin_keybind_conflicts(PluginList *list) {
         }
     }
 }
+
+/* ── Render plugin keybinds in expanded help ── */
+#ifndef BLOB_TEST
+static void render_plugin_keybinds_help(AppState *state, const AppConfig *cfg) {
+    PluginList exp_plugins = {NULL, 0, 0};
+    scan_addons_dir(&exp_plugins, cfg, cfg->addons_dir);
+    scan_addons_dir(&exp_plugins, cfg, "addons");
+    mark_plugin_keybind_conflicts(&exp_plugins, cfg);
+
+    bool has_plugins = false;
+    for (size_t i = 0; i < exp_plugins.count; i++) {
+        Plugin *p = &exp_plugins.items[i];
+        if (p->is_compiled && !p->is_disabled && !p->has_keybind_conflict && p->keybind) {
+            has_plugins = true;
+            break;
+        }
+    }
+
+    if (has_plugins) {
+        char help_line[128];
+        snprintf(help_line, sizeof(help_line), "%s─── %sPlugins%s ───", g_theme.help, g_theme.title, ANSI_RESET);
+        render_line(state, help_line);
+
+        char plugin_line[280];
+        plugin_line[0] = '\0';
+        size_t plen = 0;
+        for (size_t i = 0; i < exp_plugins.count; i++) {
+            Plugin *p = &exp_plugins.items[i];
+            if (!p->is_compiled || p->is_disabled || p->has_keybind_conflict || !p->keybind) continue;
+            char entry[64];
+            snprintf(entry, sizeof(entry), "%s[%c] %s%s", g_theme.help, p->keybind, p->name, ANSI_RESET);
+            size_t elen = strlen(entry);
+            if (plen + elen + 3 > sizeof(plugin_line)) {
+                render_line(state, plugin_line);
+                plugin_line[0] = '\0';
+                plen = 0;
+            }
+            if (plen > 0) {
+                strncat(plugin_line + plen, "  ", sizeof(plugin_line) - plen - 1);
+                plen += 2;
+            }
+            strncat(plugin_line + plen, entry, sizeof(plugin_line) - plen - 1);
+            plen += elen;
+        }
+        if (plen > 0) {
+            render_line(state, plugin_line);
+        }
+    }
+    plugin_list_free(&exp_plugins);
+}
+#endif
 
 static bool files_are_different(const char *path1, const char *path2) {
     FILE *f1 = fopen(path1, "rb");
@@ -2401,7 +2666,18 @@ static void render_plugin_ui(AppState *state, PluginList *plugins, size_t select
     if (plugins->count == 0) {
         render_line(state, ANSI_DIM "no plugins found" ANSI_RESET);
     } else {
-        char line[256];
+        /* Compute the widest plugin name for alignment */
+        size_t max_name = 15;
+        for (size_t i = 0; i < plugins->count; i++) {
+            size_t len = strlen(plugins->items[i].name);
+            if (len > max_name) max_name = len;
+        }
+        if (max_name > 25) max_name = 25;
+
+        char fmt[32];
+        snprintf(fmt, sizeof(fmt), "%%s> %%-%zus %%s%%s", max_name);
+
+        char line[280];
         for (size_t i = 0; i < plugins->count; i++) {
             Plugin *p = &plugins->items[i];
             char status[32] = "";
@@ -2423,8 +2699,18 @@ static void render_plugin_ui(AppState *state, PluginList *plugins, size_t select
                 snprintf(status, sizeof(status), "[not compiled]");
             }
 
+            /* Truncate name in display only if needed */
+            char display_name[32];
+            size_t nlen = strlen(p->name);
+            if (nlen > max_name) {
+                memcpy(display_name, p->name, max_name);
+                display_name[max_name] = '\0';
+            } else {
+                snprintf(display_name, sizeof(display_name), "%s", p->name);
+            }
+
             const char *prefix = i == selected_plugin ? g_theme.selected : "";
-            snprintf(line, sizeof(line), "%s> %-15s %s%s", prefix, p->name, status, ANSI_RESET);
+            snprintf(line, sizeof(line), fmt, prefix, display_name, status, ANSI_RESET);
             render_line(state, line);
         }
     }
@@ -2450,7 +2736,7 @@ static void render_plugin_ui(AppState *state, PluginList *plugins, size_t select
     }
 
     char help_line[128];
-    snprintf(help_line, sizeof(help_line), "%s[ENTER] install/compile/update%s", g_theme.help, ANSI_RESET);
+    snprintf(help_line, sizeof(help_line), "%s[k] set keybind  [ENTER] compile/run  [u] uninstall%s", g_theme.help, ANSI_RESET);
     render_line(state, help_line);
     snprintf(help_line, sizeof(help_line), "%s[u] uninstall (delete binary)%s", g_theme.help, ANSI_RESET);
     render_line(state, help_line);
@@ -2477,7 +2763,7 @@ static void plugin_manager_flow(AppState *state, const AppConfig *cfg) {
 
     scan_addons_dir(&plugins, cfg, cfg->addons_dir);
     scan_addons_dir(&plugins, cfg, "addons");
-    mark_plugin_keybind_conflicts(&plugins);
+    mark_plugin_keybind_conflicts(&plugins, cfg);
 
     bool check_remote = false;
     if (is_plugin_system_enabled(cfg)) {
@@ -2494,7 +2780,7 @@ static void plugin_manager_flow(AppState *state, const AppConfig *cfg) {
 
     if (check_remote) {
         fetch_remote_plugins(state, cfg, &plugins);
-        mark_plugin_keybind_conflicts(&plugins);
+        mark_plugin_keybind_conflicts(&plugins, cfg);
     }
 
     size_t selected = 0;
@@ -2515,10 +2801,46 @@ static void plugin_manager_flow(AppState *state, const AppConfig *cfg) {
                 set_plugin_system_enabled(cfg, false);
                 in_menu = false;
             }
-        } else if (key.type == KEY_ENTER) {
+        } else if (key.type == KEY_ENTER || (key.type == KEY_CHAR && key.ch == 'k')) {
             if (plugins.count > 0 && selected < plugins.count) {
                 Plugin *p = &plugins.items[selected];
-                if (!p->is_compiled || p->update_available) {
+                if (p->has_keybind_conflict || key.ch == 'k') {
+                    /* Keybind change flow */
+                    clear_owned_region(state);
+                    printf("\r" ANSI_CLEAR_LINE "Assign new keybind for \"%s\" (press a key, ESC to cancel): ", p->name);
+                    fflush(stdout);
+                    state->rendered_lines = 1;
+
+                    KeyEvent new_key = read_key();
+                    if (new_key.type == KEY_ESCAPE) {
+                        clear_owned_region(state);
+                        state->rendered_lines = 0;
+                        snprintf(state->status, sizeof(state->status), "Keybind change cancelled.");
+                    } else if (new_key.type == KEY_CHAR && new_key.ch) {
+                        /* Check if the new key is taken */
+                        char conflict_name[PLUGIN_NAME_MAX] = "";
+                        for (size_t j = 0; j < plugins.count; j++) {
+                            if (j != selected && plugins.items[j].keybind == new_key.ch) {
+                                snprintf(conflict_name, sizeof(conflict_name), "%s", plugins.items[j].name);
+                                break;
+                            }
+                        }
+                        clear_owned_region(state);
+                        state->rendered_lines = 0;
+                        if (conflict_name[0]) {
+                            snprintf(state->status, sizeof(state->status), "Key '%c' already used by \"%s\". Try 'k' to change again.", new_key.ch, conflict_name);
+                        } else {
+                            set_plugin_keybind_override(cfg, p->name, new_key.ch);
+                            p->keybind = new_key.ch;
+                            p->has_keybind_conflict = key_is_core_reserved(new_key.ch);
+                            snprintf(state->status, sizeof(state->status), "\"%s\" keybind set to '%c'.", p->name, new_key.ch);
+                        }
+                    } else {
+                        clear_owned_region(state);
+                        state->rendered_lines = 0;
+                        snprintf(state->status, sizeof(state->status), "Invalid key.");
+                    }
+                } else if (!p->is_compiled || p->update_available) {
                     compile_plugin(state, cfg, p);
                 } else {
                     snprintf(state->status, sizeof(state->status), "Already compiled. Press '%c' on notes list.", p->keybind);
@@ -2641,7 +2963,7 @@ static bool run_named_plugin(AppState *state, const AppConfig *cfg, const char *
     PluginList plugins = {NULL, 0, 0};
     scan_addons_dir(&plugins, cfg, cfg->addons_dir);
     scan_addons_dir(&plugins, cfg, "addons");
-    mark_plugin_keybind_conflicts(&plugins);
+    mark_plugin_keybind_conflicts(&plugins, cfg);
 
     for (size_t i = 0; i < plugins.count; i++) {
         Plugin *p = &plugins.items[i];
@@ -2773,6 +3095,148 @@ static void show_reminders_flow(AppState *state, const AppConfig *cfg) {
     state->rendered_lines = 0;
 }
 
+/* ── keybinding config UI ───────────────────────────────────── */
+#endif
+
+typedef struct {
+    const char *name;
+    const char *label;
+    char *field; // pointer to the char field in AppConfig
+} KeybindingEntry;
+
+#ifndef BLOB_TEST
+static void keybindings_config_flow(AppState *state, AppConfig *cfg) {
+    KeybindingEntry bindings[] = {
+        {"create",     "New note",     &cfg->key_create},
+        {"rename",     "Rename",      &cfg->key_rename},
+        {"trash",      "Trash",       &cfg->key_trash},
+        {"delete",     "Delete",      &cfg->key_delete},
+        {"trash_bin",  "Trash bin",   &cfg->key_trash_bin},
+        {"copy",       "Copy path",   &cfg->key_copy},
+        {"star",       "Star",        &cfg->key_star},
+        {"search",     "Search",      &cfg->key_search},
+        {"cmd",        "Command",     &cfg->key_cmd},
+        {"plugins",    "Plugins",     &cfg->key_plugins},
+        {"quit",       "Quit",        &cfg->key_quit},
+        {"undo",       "Undo",        &cfg->key_undo},
+        {"move_down",  "Move down",   &cfg->key_move_down},
+        {"move_up",    "Move up",     &cfg->key_move_up},
+    };
+    size_t num_bindings = sizeof(bindings) / sizeof(bindings[0]);
+    size_t sel = 0;
+    bool running = true;
+    bool modified = false;
+    char status_msg[INPUT_MAX] = "";
+
+    while (running) {
+        clear_owned_region(state);
+        render_line(state, ANSI_BOLD "blob: configure keybindings" ANSI_RESET);
+        render_line(state, "");
+
+        /* Show 12 visible entries with scrolling */
+        size_t start = 0;
+        if (sel >= VISIBLE_NOTES) start = sel - VISIBLE_NOTES + 1;
+        size_t shown = 0;
+        for (size_t i = start; i < num_bindings && shown < VISIBLE_NOTES; i++, shown++) {
+            char line[128];
+            char key_str[4] = {bindings[i].field[0], '\0', '\0', '\0'};
+            if (bindings[i].field[0] == '\0') {
+                snprintf(key_str, sizeof(key_str), "?");
+            } else if (bindings[i].field[0] == ' ') {
+                snprintf(key_str, sizeof(key_str), "Space");
+            } else if (bindings[i].field[0] == 127) {
+                snprintf(key_str, sizeof(key_str), "Bksp");
+            } else {
+                key_str[0] = bindings[i].field[0];
+                key_str[1] = '\0';
+            }
+            const char *prefix = (i == sel) ? g_theme.selected : "";
+            snprintf(line, sizeof(line), "%s> %-14s %s[%s]%s",
+                     prefix,
+                     bindings[i].label,
+                     g_theme.title,
+                     key_str,
+                     ANSI_RESET);
+            render_line(state, line);
+        }
+
+        render_line(state, "");
+        render_line(state, ANSI_DIM "────────────────────────────────" ANSI_RESET);
+        render_line(state, "");
+
+        char help[128];
+        snprintf(help, sizeof(help), "%s[%c/%c] navigate  [ENTER] edit%s", g_theme.help, cfg->key_move_up, cfg->key_move_down, ANSI_RESET);
+        render_line(state, help);
+        snprintf(help, sizeof(help), "%s[Ctrl+S] save  [Ctrl+D] discard%s", g_theme.help, ANSI_RESET);
+        render_line(state, help);
+        snprintf(help, sizeof(help), "%s[ESC/q] back%s", g_theme.help, ANSI_RESET);
+        render_line(state, help);
+
+        if (status_msg[0]) {
+            render_line(state, "");
+            char sl[INPUT_MAX + 16];
+            snprintf(sl, sizeof(sl), "%s%s%s", g_theme.status, status_msg, ANSI_RESET);
+            render_line(state, sl);
+            status_msg[0] = '\0';
+        }
+
+        fflush(stdout);
+
+        KeyEvent key = read_key();
+
+        if (key.type == KEY_UP || (key.type == KEY_CHAR && key.ch == cfg->key_move_up)) {
+            if (sel > 0) sel--;
+        } else if (key.type == KEY_DOWN || (key.type == KEY_CHAR && key.ch == cfg->key_move_down)) {
+            if (sel + 1 < num_bindings) sel++;
+        } else if (key.type == KEY_ESCAPE ||
+                   (key.type == KEY_CHAR && (key.ch == 'q' || key.ch == cfg->key_quit))) {
+            if (modified) {
+                snprintf(status_msg, sizeof(status_msg), "Changes discarded!");
+                /* Reload original config to discard changes */
+                load_config(cfg);
+                load_theme(cfg);
+            }
+            running = false;
+        } else if (key.type == KEY_CTRL_S) {
+            save_config(cfg);
+            load_theme(cfg);
+            snprintf(status_msg, sizeof(status_msg), "Keybindings saved!");
+            modified = false;
+        } else if (key.type == KEY_CTRL_D) {
+            if (modified) {
+                load_config(cfg);
+                load_theme(cfg);
+            }
+            snprintf(status_msg, sizeof(status_msg), "Changes discarded!");
+            modified = false;
+            running = false;
+        } else if (key.type == KEY_ENTER) {
+            /* Edit the selected keybinding */
+            clear_owned_region(state);
+            disable_raw_mode();
+            printf("  Press new key for \"%s\" (currently [%c]):\n",
+                   bindings[sel].label,
+                   *bindings[sel].field ? *bindings[sel].field : '?');
+            printf("  > ");
+            fflush(stdout);
+            enable_raw_mode();
+
+            KeyEvent new_key = read_key();
+            if (new_key.type == KEY_CHAR && new_key.ch != 27) {
+                *bindings[sel].field = new_key.ch;
+                modified = true;
+                snprintf(status_msg, sizeof(status_msg), "Set \"%s\" to [%c]", bindings[sel].label, new_key.ch);
+            } else if (new_key.type == KEY_ESCAPE) {
+                snprintf(status_msg, sizeof(status_msg), "Cancelled");
+            }
+        }
+    }
+
+    state->rendered_lines = 0;
+}
+#endif
+
+#ifndef BLOB_TEST
 static void command_palette_flow(AppState *state, const AppConfig *cfg) {
     char command[INPUT_MAX];
     command[0] = '\0';
@@ -2800,6 +3264,8 @@ static void command_palette_flow(AppState *state, const AppConfig *cfg) {
         copy_path_to_clipboard(state, cfg);
     } else if (strcmp(command, "plugins") == 0 || strcmp(command, "plugin") == 0) {
         plugin_manager_flow(state, cfg);
+    } else if (strcmp(command, "keys") == 0 || strcmp(command, "keybindings") == 0 || strcmp(command, "bindings") == 0) {
+        keybindings_config_flow(state, (AppConfig *)cfg);
     } else if (strcmp(command, "quit") == 0 || strcmp(command, "q") == 0) {
         state->running = false;
     } else if (!run_named_plugin(state, cfg, command)) {
@@ -2808,6 +3274,37 @@ static void command_palette_flow(AppState *state, const AppConfig *cfg) {
 }
 #endif
 
+static void undo_last_action(AppState *state, const AppConfig *cfg) {
+    if (state->undo.type == UNDO_NONE) {
+        snprintf(state->status, sizeof(state->status), "Nothing to undo");
+        return;
+    }
+
+    switch (state->undo.type) {
+    case UNDO_TRASH:
+        if (rename(state->undo.current_path, state->undo.target_path) == 0) {
+            snprintf(state->status, sizeof(state->status), "Undid trash of \"%s\"", state->undo.title);
+        } else {
+            snprintf(state->status, sizeof(state->status), "Undo failed: %s", strerror(errno));
+        }
+        break;
+    case UNDO_RENAME:
+        if (rename(state->undo.current_path, state->undo.target_path) == 0) {
+            snprintf(state->status, sizeof(state->status), "Undid rename of \"%s\"", state->undo.title);
+        } else {
+            snprintf(state->status, sizeof(state->status), "Undo failed: %s", strerror(errno));
+        }
+        break;
+    default:
+        break;
+    }
+
+    state->undo.type = UNDO_NONE;
+    load_notes(&state->notes, cfg);
+    load_favorites_for_list(&state->notes, cfg);
+    normalize_selection(state);
+}
+
 #ifndef BLOB_TEST
 static void handle_key(AppState *state, const AppConfig *cfg, KeyEvent key) {
     if (key.type == KEY_UP) {
@@ -2815,6 +3312,15 @@ static void handle_key(AppState *state, const AppConfig *cfg, KeyEvent key) {
         return;
     }
     if (key.type == KEY_DOWN) {
+        move_selection(state, 1);
+        return;
+    }
+    // Vim-style navigation
+    if (key.type == KEY_CHAR && key.ch == cfg->key_move_up) {
+        move_selection(state, -1);
+        return;
+    }
+    if (key.type == KEY_CHAR && key.ch == cfg->key_move_down) {
         move_selection(state, 1);
         return;
     }
@@ -2841,53 +3347,51 @@ static void handle_key(AppState *state, const AppConfig *cfg, KeyEvent key) {
         show_reminders_flow(state, cfg);
         return;
     }
+    if (key.type == KEY_CTRL_K) {
+        keybindings_config_flow(state, (AppConfig *)cfg);
+        return;
+    }
+    if (key.type == KEY_CTRL_O) {
+        state->show_help_expanded = !state->show_help_expanded;
+        return;
+    }
 
     if (key.type != KEY_CHAR) {
         return;
     }
 
-    switch (key.ch) {
-    case 'q':
+    if (key.ch == cfg->key_quit) {
         state->running = false;
-        break;
-    case 'n':
+    } else if (key.ch == cfg->key_create) {
         create_note_flow(state, cfg);
-        break;
-    case 'r':
+    } else if (key.ch == cfg->key_rename) {
         rename_note_flow(state, cfg);
-        break;
-    case 'd':
+    } else if (key.ch == cfg->key_trash) {
         delete_note_flow(state, cfg);
-        break;
-    case 'D':
+    } else if (key.ch == cfg->key_delete) {
         hard_delete_note_flow(state, cfg);
-        break;
-    case 't':
+    } else if (key.ch == cfg->key_trash_bin) {
         trash_viewer_flow(state, cfg);
-        break;
-    case 'y':
+    } else if (key.ch == cfg->key_copy) {
         copy_path_to_clipboard(state, cfg);
-        break;
-    case '*':
+    } else if (key.ch == cfg->key_star) {
         toggle_favorite(state, cfg);
-        break;
-    case '/':
+    } else if (key.ch == cfg->key_search) {
         state->search_mode = true;
         state->search[0] = '\0';
         normalize_selection(state);
-        break;
-    case 'p':
+    } else if (key.ch == cfg->key_plugins) {
         plugin_manager_flow(state, cfg);
-        break;
-    case ':':
+    } else if (key.ch == cfg->key_cmd) {
         command_palette_flow(state, cfg);
-        break;
-    default:
+    } else if (key.ch == cfg->key_undo) {
+        undo_last_action(state, cfg);
+    } else {
         if (is_plugin_system_enabled(cfg) && state->notes.count > 0 && selected_is_visible(state)) {
             PluginList temp_plugins = {NULL, 0, 0};
             scan_addons_dir(&temp_plugins, cfg, cfg->addons_dir);
             scan_addons_dir(&temp_plugins, cfg, "addons");
-            mark_plugin_keybind_conflicts(&temp_plugins);
+            mark_plugin_keybind_conflicts(&temp_plugins, cfg);
 
             for (size_t i = 0; i < temp_plugins.count; i++) {
                 Plugin *p = &temp_plugins.items[i];
@@ -2905,7 +3409,6 @@ static void handle_key(AppState *state, const AppConfig *cfg, KeyEvent key) {
             }
             plugin_list_free(&temp_plugins);
         }
-        break;
     }
 }
 #endif
@@ -2915,7 +3418,7 @@ static void ui_loop(AppState *state, const AppConfig *cfg) {
     enable_raw_mode();
 
     while (state->running) {
-        render_ui(state);
+        render_ui(state, cfg);
         KeyEvent key = read_key();
         handle_key(state, cfg, key);
     }
