@@ -10,3 +10,4 @@ open-dir
 export
 remind
 themes
+auto-save
