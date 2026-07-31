@@ -19,6 +19,12 @@ jobs:
     runs-on: ubuntu-latest
     container: archlinux:latest
 
+    # pass ssh options to git directly (config file in $HOME/.ssh is NOT
+    # reliably read by git's ssh in GH Actions containers); accept-new
+    # auto-trusts the host key on first connect so no keyscan is needed
+    env:
+      GIT_SSH_COMMAND: "ssh -i $HOME/.ssh/aur -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+
     steps:
       - name: install tools
         shell: bash
@@ -33,7 +39,6 @@ jobs:
         shell: bash
         env:
           AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
-          AUR_SSH_KNOWN_HOSTS: ${{ secrets.AUR_SSH_KNOWN_HOSTS }}
         run: |
           set -e
 
@@ -42,31 +47,10 @@ jobs:
             exit 1
           fi
 
-          SSH_DIR="$HOME/.ssh"
-          mkdir -p "$SSH_DIR"
-          chmod 700 "$SSH_DIR"
-          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > "$SSH_DIR/aur"
-          chmod 600 "$SSH_DIR/aur"
-
-          if [ -n "$AUR_SSH_KNOWN_HOSTS" ]; then
-            printf '%s\n' "$AUR_SSH_KNOWN_HOSTS" > "$SSH_DIR/known_hosts"
-          else
-            # -4 forces IPv4: ssh-keyscan can return nothing on hosts that only
-            # resolve over IPv6 in GH Actions containers, leaving an empty
-            # known_hosts -> "Host key verification failed"
-            ssh-keyscan -4 -H aur.archlinux.org > "$SSH_DIR/known_hosts"
-          fi
-
-          if [ ! -s "$SSH_DIR/known_hosts" ]; then
-            echo "ERROR: known_hosts is empty. Set the AUR_SSH_KNOWN_HOSTS secret or check container network."
-            exit 1
-          fi
-          chmod 644 "$SSH_DIR/known_hosts"
-
-          # NOTE: using printf instead of heredoc to avoid YAML indentation conflicts
-          # accept-new: auto-accepts the host key on first connect, still verifies on later ones
-          printf 'Host aur.archlinux.org\n  User aur\n  IdentityFile %s/aur\n  IdentitiesOnly yes\n  StrictHostKeyChecking accept-new\n  UserKnownHostsFile %s/known_hosts\n' "$SSH_DIR" "$SSH_DIR" > "$SSH_DIR/config"
-          chmod 600 "$SSH_DIR/config"
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > "$HOME/.ssh/aur"
+          chmod 600 "$HOME/.ssh/aur"
 
       - name: resolve version
         id: version
