@@ -25,6 +25,10 @@ jobs:
         run: |
           pacman -Sy --noconfirm --needed base-devel curl git jq openssh
 
+      # checkout needs git, so it must run after the tools install step
+      - name: checkout
+        uses: actions/checkout@v4
+
       - name: configure ssh
         shell: bash
         env:
@@ -80,51 +84,15 @@ jobs:
           fi
 
           echo "tag=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "version=${VERSION#v}" >> "$GITHUB_OUTPUT"
 
       - name: clone aur package
         shell: bash
         run: |
           git clone ssh://aur@aur.archlinux.org/blob-bin.git aur
 
+      # copies the PKGBUILD from this repo, then lets update.sh handle
+      # hashes, .SRCINFO regeneration, commit, and push
       - name: update pkgbuild
-        working-directory: aur
-        shell: bash
-        env:
-          TAG: ${{ steps.version.outputs.tag }}
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          set -e
-
-          echo "==> Fetching SHA256SUMS for $TAG..."
-          SUMS=$(curl -fsSL "https://github.com/aaravmaloo/blob/releases/download/$TAG/SHA256SUMS")
-
-          if [ -z "$SUMS" ]; then
-            echo "ERROR: Could not fetch SHA256SUMS. Does release $TAG exist?"
-            exit 1
-          fi
-
-          AMD64=$(echo "$SUMS" | grep 'linux-amd64/dist/blob-linux-amd64' | awk '{print $1}')
-          ARM64=$(echo "$SUMS" | grep 'linux-arm64/dist/blob-linux-arm64' | awk '{print $1}')
-
-          if [ -z "$AMD64" ] || [ -z "$ARM64" ]; then
-            echo "ERROR: Could not parse hashes from SHA256SUMS"
-            echo "$SUMS"
-            exit 1
-          fi
-
-          echo "==> amd64: $AMD64"
-          echo "==> arm64: $ARM64"
-
-          echo "==> Updating PKGBUILD..."
-          sed -i "s/pkgver=.*/pkgver=$VERSION/" PKGBUILD
-          sed -i "s/sha256sums_x86_64=('[^']*')/sha256sums_x86_64=('$AMD64')/" PKGBUILD
-          sed -i "s/sha256sums_aarch64=('[^']*')/sha256sums_aarch64=('$ARM64')/" PKGBUILD
-
-          echo "==> Regenerating .SRCINFO..."
-          makepkg --printsrcinfo > .SRCINFO
-
-      - name: commit and push
         working-directory: aur
         shell: bash
         env:
@@ -133,11 +101,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add PKGBUILD .SRCINFO
-          if git diff --cached --quiet; then
-            echo "No AUR changes to publish."
-            exit 0
-          fi
-
-          git commit -m "update to $TAG"
-          git push
+          cp ../aur_publish/PKGBUILD ./PKGBUILD
+          ../aur_publish/update.sh "$TAG"
