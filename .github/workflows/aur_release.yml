@@ -35,6 +35,8 @@ jobs:
           AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
           AUR_SSH_KNOWN_HOSTS: ${{ secrets.AUR_SSH_KNOWN_HOSTS }}
         run: |
+          set -e
+
           if [ -z "$AUR_SSH_PRIVATE_KEY" ]; then
             echo "AUR_SSH_PRIVATE_KEY is required"
             exit 1
@@ -49,12 +51,21 @@ jobs:
           if [ -n "$AUR_SSH_KNOWN_HOSTS" ]; then
             printf '%s\n' "$AUR_SSH_KNOWN_HOSTS" > "$SSH_DIR/known_hosts"
           else
-            ssh-keyscan -H aur.archlinux.org > "$SSH_DIR/known_hosts"
+            # -4 forces IPv4: ssh-keyscan can return nothing on hosts that only
+            # resolve over IPv6 in GH Actions containers, leaving an empty
+            # known_hosts -> "Host key verification failed"
+            ssh-keyscan -4 -H aur.archlinux.org > "$SSH_DIR/known_hosts"
+          fi
+
+          if [ ! -s "$SSH_DIR/known_hosts" ]; then
+            echo "ERROR: known_hosts is empty. Set the AUR_SSH_KNOWN_HOSTS secret or check container network."
+            exit 1
           fi
           chmod 644 "$SSH_DIR/known_hosts"
 
           # NOTE: using printf instead of heredoc to avoid YAML indentation conflicts
-          printf 'Host aur.archlinux.org\n  User aur\n  IdentityFile %s/aur\n  IdentitiesOnly yes\n  StrictHostKeyChecking yes\n  UserKnownHostsFile %s/known_hosts\n' "$SSH_DIR" "$SSH_DIR" > "$SSH_DIR/config"
+          # accept-new: auto-accepts the host key on first connect, still verifies on later ones
+          printf 'Host aur.archlinux.org\n  User aur\n  IdentityFile %s/aur\n  IdentitiesOnly yes\n  StrictHostKeyChecking accept-new\n  UserKnownHostsFile %s/known_hosts\n' "$SSH_DIR" "$SSH_DIR" > "$SSH_DIR/config"
           chmod 600 "$SSH_DIR/config"
 
       - name: resolve version
