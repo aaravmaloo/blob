@@ -29,7 +29,7 @@ jobs:
       - name: install tools
         shell: bash
         run: |
-          pacman -Sy --noconfirm --needed base-devel curl git jq openssh
+          pacman -Sy --noconfirm --needed base-devel curl git jq openssh util-linux
 
       # checkout needs git, so it must run after the tools install step
       - name: checkout
@@ -97,4 +97,10 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           cp ../aur_publish/PKGBUILD ./PKGBUILD
-          ../aur_publish/update.sh "$TAG"
+
+          # makepkg refuses to run as root, so run the whole publish as a
+          # non-root user. HOME is forced explicitly because su may reset it,
+          # which would break GIT_SSH_COMMAND's $HOME/.ssh/aur key path.
+          useradd -m builder
+          chown -R builder "$PWD"
+          su -s /bin/bash builder -c "HOME=$HOME ../aur_publish/update.sh $TAG"
