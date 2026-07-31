@@ -99,8 +99,16 @@ jobs:
           cp ../aur_publish/PKGBUILD ./PKGBUILD
 
           # makepkg refuses to run as root, so run the whole publish as a
-          # non-root user. HOME is forced explicitly because su may reset it,
-          # which would break GIT_SSH_COMMAND's $HOME/.ssh/aur key path.
+          # non-root user. The builder gets its own copy of the SSH key so the
+          # final git push works (root's key is 600/root-owned and unreadable
+          # by builder), with GIT_SSH_COMMAND overridden to point at it.
           useradd -m builder
           chown -R builder "$PWD"
-          su -s /bin/bash builder -c "HOME=$HOME ../aur_publish/update.sh $TAG"
+
+          mkdir -p /home/builder/.ssh
+          cp "$HOME/.ssh/aur" /home/builder/.ssh/aur
+          chown -R builder:builder /home/builder/.ssh
+          chmod 700 /home/builder/.ssh
+          chmod 600 /home/builder/.ssh/aur
+
+          su -s /bin/bash builder -c "HOME=/home/builder GIT_SSH_COMMAND='ssh -i /home/builder/.ssh/aur -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new' ../aur_publish/update.sh $TAG"
