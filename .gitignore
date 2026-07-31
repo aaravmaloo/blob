@@ -1,3 +1,4 @@
 *.exe
 blob
 tests
+.DS_Store
