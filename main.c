@@ -2,12 +2,13 @@
 
 #define _DEFAULT_SOURCE
 
-#define BLOB_VERSION "1.3.0"
+#define BLOB_VERSION "1.4.0"
 
 #include <ctype.h>
 #include <errno.h>
 #include <limits.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -62,7 +63,8 @@
 #define TITLE_MAX 256
 #define INITIAL_NOTES_CAP 32
 #define VISIBLE_NOTES 12
-#define MAX_UNDO 1
+#define MAX_UNDO 10
+#define QUICK_VIEW_LINES 12
 
 typedef enum {
     UNDO_NONE = 0,
@@ -76,6 +78,15 @@ typedef struct {
     char target_path[PATH_MAX];
     char title[TITLE_MAX];
 } UndoAction;
+
+typedef enum {
+    SORT_MTIME = 0,
+    SORT_TITLE,
+    SORT_SIZE
+} SortMode;
+
+static SortMode g_sort_mode = SORT_MTIME;
+static bool g_sort_reverse = false;
 
 #define ANSI_RESET "\x1b[0m"
 #define ANSI_BOLD "\x1b[1m"
@@ -124,6 +135,8 @@ typedef struct {
     char editor[INPUT_MAX];
     char theme_name[64];
     char sort_order[16];
+    int purge_days;
+    bool sort_reverse;
     // Configurable keybindings (defaults set in init_paths)
     char key_create;
     char key_rename;
@@ -139,6 +152,7 @@ typedef struct {
     char key_undo;
     char key_move_down;
     char key_move_up;
+    char key_view;
 } AppConfig;
 
 typedef struct {
@@ -146,6 +160,7 @@ typedef struct {
     char filename[TITLE_MAX];
     char path[PATH_MAX];
     time_t mtime;
+    long size;
     bool is_favorite;
 } Note;
 
@@ -164,7 +179,10 @@ typedef struct {
     bool show_help_expanded;
     size_t rendered_lines;
     char status[INPUT_MAX];
-    UndoAction undo;
+    UndoAction undo_stack[MAX_UNDO];
+    size_t undo_count;
+    UndoAction redo_stack[MAX_UNDO];
+    size_t redo_count;
 } AppState;
 
 typedef enum {
@@ -183,7 +201,14 @@ typedef enum {
     KEY_CTRL_S,
     KEY_CTRL_D,
     KEY_CTRL_K,
-    KEY_CTRL_O
+    KEY_CTRL_O,
+    KEY_CTRL_T,
+    KEY_CTRL_U,
+    KEY_CTRL_Z,
+    KEY_HOME,
+    KEY_END,
+    KEY_PGUP,
+    KEY_PGDN
 } KeyType;
 
 typedef struct {
@@ -222,6 +247,23 @@ static bool note_list_push(NoteList *list, const Note *note) {
 
     list->items[list->count++] = *note;
     return true;
+}
+
+static void push_undo(AppState *state, UndoType type, const char *current_path,
+                      const char *target_path, const char *title) {
+    if (state->undo_count >= MAX_UNDO) {
+        // Drop the oldest action
+        memmove(&state->undo_stack[0], &state->undo_stack[1],
+                (MAX_UNDO - 1) * sizeof(UndoAction));
+        state->undo_count = MAX_UNDO - 1;
+    }
+    UndoAction *a = &state->undo_stack[state->undo_count++];
+    a->type = type;
+    snprintf(a->current_path, sizeof(a->current_path), "%s", current_path);
+    snprintf(a->target_path, sizeof(a->target_path), "%s", target_path);
+    snprintf(a->title, sizeof(a->title), "%s", title);
+    // Any new action invalidates the redo history
+    state->redo_count = 0;
 }
 
 static void disable_raw_mode(void) {
@@ -368,12 +410,24 @@ static KeyEvent read_key(void) {
         key.type = KEY_CTRL_O;
         return key;
     }
+    if (c == 20) {
+        key.type = KEY_CTRL_T;
+        return key;
+    }
+    if (c == 26) {
+        key.type = KEY_CTRL_Z;
+        return key;
+    }
     if (c == 0 || c == 224) {
         int ext = _getch();
         if (ext == 72) key.type = KEY_UP;
         else if (ext == 80) key.type = KEY_DOWN;
         else if (ext == 75) key.type = KEY_LEFT;
         else if (ext == 77) key.type = KEY_RIGHT;
+        else if (ext == 71) key.type = KEY_HOME;
+        else if (ext == 79) key.type = KEY_END;
+        else if (ext == 73) key.type = KEY_PGUP;
+        else if (ext == 81) key.type = KEY_PGDN;
         return key;
     }
 
@@ -422,6 +476,18 @@ static KeyEvent read_key(void) {
         key.type = KEY_CTRL_O;
         return key;
     }
+    if (c == 20) {
+        key.type = KEY_CTRL_T;
+        return key;
+    }
+    if (c == 21) {
+        key.type = KEY_CTRL_U;
+        return key;
+    }
+    if (c == 26) {
+        key.type = KEY_CTRL_Z;
+        return key;
+    }
     if (c == '\x1b') {
         char seq[2];
 
@@ -453,6 +519,24 @@ static KeyEvent read_key(void) {
             else if (seq[1] == 'B') key.type = KEY_DOWN;
             else if (seq[1] == 'C') key.type = KEY_RIGHT;
             else if (seq[1] == 'D') key.type = KEY_LEFT;
+            else if (seq[1] == 'H') key.type = KEY_HOME;
+            else if (seq[1] == 'F') key.type = KEY_END;
+            else if (seq[1] == '5' || seq[1] == '6') {
+                // PgUp/PgDn arrive as ESC [ 5 ~ / ESC [ 6 ~ (3 bytes after ESC)
+                char seq2 = 0;
+                FD_ZERO(&set);
+                FD_SET(STDIN_FILENO, &set);
+                timeout.tv_sec = 0;
+                timeout.tv_usec = 100000;
+                if (select(STDIN_FILENO + 1, &set, NULL, NULL, &timeout) > 0 &&
+                    read(STDIN_FILENO, &seq2, 1) == 1 && seq2 == '~') {
+                    key.type = (seq[1] == '5') ? KEY_PGUP : KEY_PGDN;
+                }
+            }
+        } else if (seq[0] == 'O') {
+            // Application-mode Home/End: ESC O H / ESC O F
+            if (seq[1] == 'H') key.type = KEY_HOME;
+            else if (seq[1] == 'F') key.type = KEY_END;
         }
         return key;
     }
@@ -546,6 +630,8 @@ static void init_paths(AppConfig *cfg) {
     // Default settings
     snprintf(cfg->theme_name, sizeof(cfg->theme_name), "default");
     snprintf(cfg->sort_order, sizeof(cfg->sort_order), "mtime");
+    cfg->purge_days = 30;
+    cfg->sort_reverse = false;
 
     // Default keybindings
     cfg->key_create = 'n';
@@ -562,6 +648,7 @@ static void init_paths(AppConfig *cfg) {
     cfg->key_undo = 'u';
     cfg->key_move_down = 'j';
     cfg->key_move_up = 'k';
+    cfg->key_view = 'v';
 
     // Initial setup diagnostics
     if (!ensure_dir(cfg->data_dir)) {
@@ -575,6 +662,12 @@ static void init_paths(AppConfig *cfg) {
     }
 }
 #endif
+
+static SortMode sort_mode_from_string(const char *s) {
+    if (s && strcmp(s, "title") == 0) return SORT_TITLE;
+    if (s && strcmp(s, "size") == 0) return SORT_SIZE;
+    return SORT_MTIME;
+}
 
 /* ── themes ──────────────────────────────────────────────────────────────── */
 
@@ -615,6 +708,14 @@ static void load_config(AppConfig *cfg) {
             snprintf(cfg->theme_name, sizeof(cfg->theme_name), "%s", value);
         } else if (strcmp(key, "sort") == 0) {
             snprintf(cfg->sort_order, sizeof(cfg->sort_order), "%s", value);
+            g_sort_mode = sort_mode_from_string(cfg->sort_order);
+        } else if (strcmp(key, "sort_reverse") == 0) {
+            cfg->sort_reverse = (strcmp(value, "true") == 0 ||
+                                 strcmp(value, "1") == 0 ||
+                                 strcmp(value, "yes") == 0);
+            g_sort_reverse = cfg->sort_reverse;
+        } else if (strcmp(key, "purge_days") == 0) {
+            cfg->purge_days = atoi(value);
         } else if (strncmp(key, "key_", 4) == 0) {
             if (value[0]) {
                 if (strcmp(key + 4, "create") == 0) cfg->key_create = value[0];
@@ -631,6 +732,7 @@ static void load_config(AppConfig *cfg) {
                 else if (strcmp(key + 4, "undo") == 0) cfg->key_undo = value[0];
                 else if (strcmp(key + 4, "move_down") == 0) cfg->key_move_down = value[0];
                 else if (strcmp(key + 4, "move_up") == 0) cfg->key_move_up = value[0];
+                else if (strcmp(key + 4, "view") == 0) cfg->key_view = value[0];
             }
         }
     }
@@ -644,6 +746,8 @@ static void save_config(const AppConfig *cfg) {
     fprintf(f, "editor = %s\n", cfg->editor);
     fprintf(f, "theme = %s\n", cfg->theme_name);
     fprintf(f, "sort = %s\n", cfg->sort_order);
+    fprintf(f, "sort_reverse = %s\n", cfg->sort_reverse ? "true" : "false");
+    fprintf(f, "purge_days = %d\n", cfg->purge_days);
     fprintf(f, "key_create = %c\n", cfg->key_create);
     fprintf(f, "key_rename = %c\n", cfg->key_rename);
     fprintf(f, "key_trash = %c\n", cfg->key_trash);
@@ -658,6 +762,7 @@ static void save_config(const AppConfig *cfg) {
     fprintf(f, "key_undo = %c\n", cfg->key_undo);
     fprintf(f, "key_move_down = %c\n", cfg->key_move_down);
     fprintf(f, "key_move_up = %c\n", cfg->key_move_up);
+    fprintf(f, "key_view = %c\n", cfg->key_view);
     fclose(f);
 }
 
@@ -818,10 +923,23 @@ static int note_cmp(const void *a, const void *b) {
     if (left->is_favorite && !right->is_favorite) return -1;
     if (!left->is_favorite && right->is_favorite) return 1;
 
-    // Within each group, sort by mtime descending
-    if (left->mtime < right->mtime) return 1;
-    if (left->mtime > right->mtime) return -1;
-    return strcmp(left->title, right->title);
+    int r = 0;
+    switch (g_sort_mode) {
+    case SORT_TITLE:
+        r = strcmp(left->title, right->title);
+        break;
+    case SORT_SIZE:
+        if (left->size < right->size) r = -1;
+        else if (left->size > right->size) r = 1;
+        break;
+    case SORT_MTIME:
+    default:
+        if (left->mtime < right->mtime) r = 1;
+        else if (left->mtime > right->mtime) r = -1;
+        break;
+    }
+    if (r == 0) r = strcmp(left->title, right->title);
+    return g_sort_reverse ? -r : r;
 }
 
 static bool load_notes(NoteList *list, const AppConfig *cfg) {
@@ -851,6 +969,7 @@ static bool load_notes(NoteList *list, const AppConfig *cfg) {
         struct stat st;
         if (stat(note.path, &st) == 0) {
             note.mtime = st.st_mtime;
+            note.size = (long)st.st_size;
         }
 
         if (!note_list_push(list, &note)) {
@@ -881,6 +1000,7 @@ static bool load_notes(NoteList *list, const AppConfig *cfg) {
         struct stat st;
         if (stat(note.path, &st) == 0 && STAT_ISREG(st.st_mode)) {
             note.mtime = st.st_mtime;
+            note.size = (long)st.st_size;
             if (!note_list_push(list, &note)) {
                 closedir(dir);
                 return false;
@@ -1196,11 +1316,14 @@ static void render_ui(AppState *state, const AppConfig *cfg) {
                      cfg->key_cmd, cfg->key_plugins, cfg->key_undo,
                      cfg->key_move_up, cfg->key_move_down, cfg->key_quit, ANSI_RESET);
             render_line(state, help_line);
+            snprintf(help_line, sizeof(help_line), "%s[%c] view  [g/G] top/bottom  [PgUp/PgDn] page%s", g_theme.help,
+                     cfg->key_view, ANSI_RESET);
+            render_line(state, help_line);
 
             /* ── Ctrl shortcuts ── */
             snprintf(help_line, sizeof(help_line), "%s─── %sCtrl%s ───", g_theme.help, g_theme.title, ANSI_RESET);
             render_line(state, help_line);
-            snprintf(help_line, sizeof(help_line), "%s[Ctrl+R] remind  [Ctrl+K] change keys  [Ctrl+O] less%s", g_theme.help, ANSI_RESET);
+            snprintf(help_line, sizeof(help_line), "%s[Ctrl+R] remind  [Ctrl+K] change keys  [Ctrl+O] less  [Ctrl+T] sort  [Ctrl+Z] redo%s", g_theme.help, ANSI_RESET);
             render_line(state, help_line);
 
             /* ── Plugin keybinds ── */
@@ -1217,10 +1340,12 @@ static void render_ui(AppState *state, const AppConfig *cfg) {
             snprintf(help_line, sizeof(help_line), "%s[%c] trash  [%c] delete%s", g_theme.help,
                      cfg->key_trash, cfg->key_delete, ANSI_RESET);
             render_line(state, help_line);
-            snprintf(help_line, sizeof(help_line), "%s[%c] bin  [%c] search%s", g_theme.help,
-                     cfg->key_trash_bin, cfg->key_search, ANSI_RESET);
+            snprintf(help_line, sizeof(help_line), "%s[%c] bin  [%c] search  [%c] view%s", g_theme.help,
+                     cfg->key_trash_bin, cfg->key_search, cfg->key_view, ANSI_RESET);
             render_line(state, help_line);
-            snprintf(help_line, sizeof(help_line), "%s[Ctrl+O] more  [Ctrl+R] remind  [Ctrl+K] keys  [%c] quit%s", g_theme.help,
+            snprintf(help_line, sizeof(help_line), "%s[g/G] top/bottom  [Ctrl+U/D] half-page  [Ctrl+Z] redo%s", g_theme.help, ANSI_RESET);
+            render_line(state, help_line);
+            snprintf(help_line, sizeof(help_line), "%s[Ctrl+O] more  [Ctrl+R] remind  [Ctrl+K] keys  [Ctrl+T] sort  [%c] quit%s", g_theme.help,
                      cfg->key_quit, ANSI_RESET);
             render_line(state, help_line);
         }
@@ -1445,16 +1570,13 @@ static void delete_note_flow(AppState *state, const AppConfig *cfg) {
     unique_path_in_dir(trash_dir, selected.filename, trash_path, sizeof(trash_path));
 
     size_t previous = state->selected;
-    state->undo.type = UNDO_TRASH;
-    snprintf(state->undo.current_path, sizeof(state->undo.current_path), "%s", trash_path);
-    snprintf(state->undo.target_path, sizeof(state->undo.target_path), "%s", selected.path);
-    snprintf(state->undo.title, sizeof(state->undo.title), "%s", selected.title);
 
     if (rename(selected.path, trash_path) != 0) {
         snprintf(state->status, sizeof(state->status), "failed to trash note: %s", strerror(errno));
-        state->undo.type = UNDO_NONE;
         return;
     }
+
+    push_undo(state, UNDO_TRASH, trash_path, selected.path, selected.title);
 
     snprintf(state->status, sizeof(state->status), "Trashed \"%s\" (press %c to undo)", selected.title, cfg->key_undo);
 
@@ -1512,7 +1634,10 @@ static bool load_trash_notes(NoteList *list, const AppConfig *cfg) {
         title_from_filename(note.title, sizeof(note.title), note.filename);
         snprintf(note.path, sizeof(note.path), "%s" PATH_SEP "%s", trash_dir, note.filename);
         struct stat st;
-        if (stat(note.path, &st) == 0) note.mtime = st.st_mtime;
+        if (stat(note.path, &st) == 0) {
+            note.mtime = st.st_mtime;
+            note.size = (long)st.st_size;
+        }
         if (!note_list_push(list, &note)) { FindClose(find); return false; }
     } while (FindNextFileA(find, &data));
     FindClose(find);
@@ -1530,6 +1655,7 @@ static bool load_trash_notes(NoteList *list, const AppConfig *cfg) {
         struct stat st;
         if (stat(note.path, &st) == 0 && STAT_ISREG(st.st_mode)) {
             note.mtime = st.st_mtime;
+            note.size = (long)st.st_size;
             if (!note_list_push(list, &note)) { closedir(dir); return false; }
         }
     }
@@ -1537,6 +1663,50 @@ static bool load_trash_notes(NoteList *list, const AppConfig *cfg) {
 #endif
     qsort(list->items, list->count, sizeof(*list->items), note_cmp);
     return true;
+}
+
+static int purge_old_trashed_notes(const AppConfig *cfg, int purge_days) {
+    if (purge_days <= 0) return 0;
+
+    char trash_dir[PATH_MAX];
+    snprintf(trash_dir, sizeof(trash_dir), "%s" PATH_SEP ".trash", cfg->notes_dir);
+
+    time_t now = time(NULL);
+    time_t cutoff = now - (time_t)purge_days * 86400;
+    int purged = 0;
+
+#ifdef _WIN32
+    char pattern[PATH_MAX];
+    snprintf(pattern, sizeof(pattern), "%s" PATH_SEP "*.md", trash_dir);
+    WIN32_FIND_DATAA data;
+    HANDLE find = FindFirstFileA(pattern, &data);
+    if (find == INVALID_HANDLE_VALUE) return 0;
+    do {
+        if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s" PATH_SEP "%s", trash_dir, data.cFileName);
+        struct stat st;
+        if (stat(path, &st) == 0 && st.st_mtime < cutoff) {
+            if (unlink(path) == 0) purged++;
+        }
+    } while (FindNextFileA(find, &data));
+    FindClose(find);
+#else
+    DIR *dir = opendir(trash_dir);
+    if (!dir) return 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (!has_md_extension(entry->d_name)) continue;
+        char path[PATH_MAX];
+        snprintf(path, sizeof(path), "%s" PATH_SEP "%s", trash_dir, entry->d_name);
+        struct stat st;
+        if (stat(path, &st) == 0 && STAT_ISREG(st.st_mode) && st.st_mtime < cutoff) {
+            if (unlink(path) == 0) purged++;
+        }
+    }
+    closedir(dir);
+#endif
+    return purged;
 }
 
 #ifndef BLOB_TEST
@@ -1675,16 +1845,12 @@ static void rename_note_flow(AppState *state, const AppConfig *cfg) {
     sanitize_slug(new_title, slug, sizeof(slug));
     unique_note_path(cfg, slug, new_path, sizeof(new_path));
 
-    state->undo.type = UNDO_RENAME;
-    snprintf(state->undo.current_path, sizeof(state->undo.current_path), "%s", new_path);
-    snprintf(state->undo.target_path, sizeof(state->undo.target_path), "%s", selected.path);
-    snprintf(state->undo.title, sizeof(state->undo.title), "%s", selected.title);
-
     if (rename(selected.path, new_path) != 0) {
         snprintf(state->status, sizeof(state->status), "failed to rename note: %s", strerror(errno));
-        state->undo.type = UNDO_NONE;
         return;
     }
+
+    push_undo(state, UNDO_RENAME, new_path, selected.path, selected.title);
 
     snprintf(state->status, sizeof(state->status), "Renamed (press %c to undo)", cfg->key_undo);
 
@@ -1781,6 +1947,29 @@ static bool save_favorites_to_disk(const AppState *state, const AppConfig *cfg) 
     }
     fclose(f);
     return true;
+}
+
+static void save_session(const AppConfig *cfg, const char *note_path) {
+    char session_path[PATH_MAX];
+    snprintf(session_path, sizeof(session_path), "%s" PATH_SEP "session", cfg->data_dir);
+    FILE *f = fopen(session_path, "w");
+    if (f) {
+        fprintf(f, "%s\n", note_path ? note_path : "");
+        fclose(f);
+    }
+}
+
+static bool load_session(const AppConfig *cfg, char *out, size_t out_size) {
+    char session_path[PATH_MAX];
+    snprintf(session_path, sizeof(session_path), "%s" PATH_SEP "session", cfg->data_dir);
+    FILE *f = fopen(session_path, "r");
+    if (!f) return false;
+    bool ok = fgets(out, (int)out_size, f) != NULL;
+    fclose(f);
+    if (ok) {
+        out[strcspn(out, "\r\n")] = '\0';
+    }
+    return ok && out[0] != '\0';
 }
 
 static void toggle_favorite(AppState *state, const AppConfig *cfg) {
@@ -1937,7 +2126,7 @@ static bool is_plugin_disabled_on_disk(const AppConfig *cfg, const char *name) {
 static void set_plugin_disabled_on_disk(const AppConfig *cfg, const char *name, bool disabled) {
     char path[PATH_MAX + 64];
     snprintf(path, sizeof(path), "%s" PATH_SEP "disabled_plugins", cfg->data_dir);
-    
+
     char names[32][PLUGIN_NAME_MAX];
     size_t count = 0;
     FILE *f = fopen(path, "r");
@@ -1971,7 +2160,7 @@ static void set_plugin_disabled_on_disk(const AppConfig *cfg, const char *name, 
 }
 
 static bool key_is_core_reserved(char key) {
-    const char *reserved = "nrdDty*/p:qujk";
+    const char *reserved = "nrdDty*/p:qujkgGv";
     return key && (strchr(reserved, key) != NULL || key == '\r' || key == '\n');
 }
 
@@ -2149,7 +2338,7 @@ static void scan_addons_dir(PluginList *list, const AppConfig *cfg, const char *
 
         char readme_path[PATH_MAX];
         snprintf(readme_path, sizeof(readme_path), "%s\\README.md", p.dir_path);
-        
+
         if (parse_plugin_readme(readme_path, &p)) {
             if (access(p.exe_path, 0) == 0) {
                 p.is_compiled = true;
@@ -2194,7 +2383,7 @@ static void scan_addons_dir(PluginList *list, const AppConfig *cfg, const char *
 
             char readme_path[PATH_MAX];
             snprintf(readme_path, sizeof(readme_path), "%s/README.md", p.dir_path);
-            
+
             if (parse_plugin_readme(readme_path, &p)) {
                 if (access(p.exe_path, 0) == 0) {
                     p.is_compiled = true;
@@ -2324,7 +2513,7 @@ static void fetch_remote_plugins(AppState *state, const AppConfig *cfg, PluginLi
 
     char cmd[PATH_MAX * 2 + 128];
     snprintf(cmd, sizeof(cmd), "curl -s -f -L \"https://raw.githubusercontent.com/aaravmaloo/blob/master/addons/addons.txt\" -o \"%s\"", temp_index);
-    
+
     int ret = system(cmd);
     if (ret != 0) {
         printf("Error: failed to fetch remote plugins (network error or curl missing).\n");
@@ -2377,7 +2566,7 @@ static void fetch_remote_plugins(AppState *state, const AppConfig *cfg, PluginLi
 
         char temp_readme[PATH_MAX];
         snprintf(temp_readme, sizeof(temp_readme), "%s" PATH_SEP "temp_readme_%s.md", cfg->data_dir, line);
-        
+
         snprintf(cmd, sizeof(cmd), "curl -s -f -L \"https://raw.githubusercontent.com/aaravmaloo/blob/master/addons/%s/README.md\" -o \"%s\"", line, temp_readme);
         if (system(cmd) == 0) {
             Plugin p;
@@ -2500,7 +2689,7 @@ static bool compile_plugin(AppState *state, const AppConfig *cfg, Plugin *plugin
     if (plugin->is_remote || plugin->update_available) {
         printf("Downloading plugin source files...\n");
         fflush(stdout);
-        
+
         snprintf(cmd, sizeof(cmd), "curl -s -f -L \"https://raw.githubusercontent.com/aaravmaloo/blob/master/addons/%s/%s.c\" -o \"%s\"", plugin->name, plugin->name, plugin->c_path);
         if (system(cmd) != 0) {
             printf("Error: failed to download C source file.\nPress any key to continue...");
@@ -2959,6 +3148,224 @@ static void lower_ascii(char *s) {
     }
 }
 
+#ifndef BLOB_TEST
+static void quick_view_flow(AppState *state, const AppConfig *cfg) {
+    if (state->notes.count == 0 || !selected_is_visible(state)) {
+        return;
+    }
+
+    const Note *selected = &state->notes.items[state->selected];
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s", selected->path);
+
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        snprintf(state->status, sizeof(state->status), "cannot read note: %s", strerror(errno));
+        return;
+    }
+
+    // Read all lines into memory
+    char **lines = NULL;
+    size_t line_count = 0;
+    size_t capacity = 0;
+    char buf[1024];
+    while (fgets(buf, sizeof(buf), f)) {
+        size_t len = strlen(buf);
+        while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r')) {
+            buf[--len] = '\0';
+        }
+        if (line_count == capacity) {
+            capacity = capacity ? capacity * 2 : 64;
+            char **next = realloc(lines, capacity * sizeof(*next));
+            if (!next) break;
+            lines = next;
+        }
+        lines[line_count] = malloc(len + 1);
+        if (!lines[line_count]) break;
+        memcpy(lines[line_count], buf, len + 1);
+        line_count++;
+    }
+    fclose(f);
+
+    size_t scroll = 0;
+    bool running = true;
+
+    while (running) {
+        clear_owned_region(state);
+
+        char header[TITLE_MAX + 32];
+        snprintf(header, sizeof(header), "%sblob: view — %s%s", ANSI_BOLD, selected->title, ANSI_RESET);
+        render_line(state, header);
+        render_line(state, "");
+
+        if (line_count == 0) {
+            render_line(state, ANSI_DIM "(empty note)" ANSI_RESET);
+        } else {
+            size_t shown = 0;
+            for (size_t i = scroll; i < line_count && shown < QUICK_VIEW_LINES; i++, shown++) {
+                char line[1100];
+                snprintf(line, sizeof(line), "%s%s", shown == 0 ? g_theme.selected : "", lines[i]);
+                render_line(state, line);
+            }
+            if (line_count > QUICK_VIEW_LINES) {
+                char page_info[64];
+                size_t end_visible = scroll + shown > line_count ? line_count : scroll + shown;
+                snprintf(page_info, sizeof(page_info), "%sLines %zu-%zu of %zu%s", g_theme.pagination,
+                         scroll + 1, end_visible, line_count, ANSI_RESET);
+                render_line(state, page_info);
+            }
+        }
+
+        render_line(state, "");
+        render_line(state, ANSI_DIM "────────────────────────────────" ANSI_RESET);
+        render_line(state, "");
+
+        char help_line[128];
+        snprintf(help_line, sizeof(help_line), "%s[%c/%c] scroll  [g/G] top/bottom  [e] edit%s", g_theme.help,
+                 cfg->key_move_up, cfg->key_move_down, ANSI_RESET);
+        render_line(state, help_line);
+        snprintf(help_line, sizeof(help_line), "%s[ESC/%c] back%s", g_theme.help, cfg->key_quit, ANSI_RESET);
+        render_line(state, help_line);
+        fflush(stdout);
+
+        KeyEvent key = read_key();
+        if (key.type == KEY_UP || (key.type == KEY_CHAR && key.ch == cfg->key_move_up)) {
+            if (scroll > 0) scroll--;
+        } else if (key.type == KEY_DOWN || (key.type == KEY_CHAR && key.ch == cfg->key_move_down)) {
+            if (line_count > 0 && scroll + QUICK_VIEW_LINES < line_count) scroll++;
+        } else if (key.type == KEY_PGUP) {
+            scroll = scroll > QUICK_VIEW_LINES ? scroll - QUICK_VIEW_LINES : 0;
+        } else if (key.type == KEY_PGDN) {
+            scroll += QUICK_VIEW_LINES;
+            if (scroll >= line_count && line_count > 0) {
+                scroll = line_count - 1;
+            }
+        } else if (key.type == KEY_HOME || (key.type == KEY_CHAR && key.ch == 'g')) {
+            scroll = 0;
+        } else if (key.type == KEY_END || (key.type == KEY_CHAR && key.ch == 'G')) {
+            if (line_count > 0) scroll = line_count > QUICK_VIEW_LINES ? line_count - QUICK_VIEW_LINES : 0;
+        } else if (key.type == KEY_CHAR && key.ch == 'e') {
+            running = false;
+            open_path_in_editor(state, cfg, path);
+        } else if (key.type == KEY_ESCAPE || (key.type == KEY_CHAR && key.ch == cfg->key_quit)) {
+            running = false;
+        }
+    }
+
+    for (size_t i = 0; i < line_count; i++) {
+        free(lines[i]);
+    }
+    free(lines);
+    state->rendered_lines = 0;
+}
+#endif
+
+#ifndef BLOB_TEST
+static int build_doctor_report(const AppConfig *cfg, char *buf, size_t buf_size) {
+    int failed = 0;
+    size_t off = 0;
+
+#define REPORT(...) \
+    do { \
+        int n = snprintf(buf + off, buf_size - off, __VA_ARGS__); \
+        if (n > 0) off += (size_t)n; \
+        if (off >= buf_size) return failed; \
+    } while (0)
+
+    REPORT("blob doctor\n");
+    REPORT("===========\n");
+
+    struct stat st;
+    if (stat(cfg->data_dir, &st) == 0 && STAT_ISDIR(st.st_mode)) {
+        REPORT("[ok]  data dir exists: %s\n", cfg->data_dir);
+    } else {
+        REPORT("[!!]  data dir missing: %s\n", cfg->data_dir);
+        failed = 1;
+    }
+    if (stat(cfg->notes_dir, &st) == 0 && STAT_ISDIR(st.st_mode)) {
+        REPORT("[ok]  notes dir exists: %s\n", cfg->notes_dir);
+    } else {
+        REPORT("[!!]  notes dir missing: %s\n", cfg->notes_dir);
+        failed = 1;
+    }
+    FILE *f = fopen(cfg->config_path, "r");
+    if (f) {
+        fclose(f);
+        REPORT("[ok]  config file readable\n");
+    } else {
+        REPORT("[..]  no config file (defaults in use)\n");
+    }
+    f = fopen(cfg->favorites_path, "r");
+    if (f) {
+        fclose(f);
+        REPORT("[ok]  favorites file readable\n");
+    } else {
+        REPORT("[..]  no favorites file\n");
+    }
+    char kb_path[PATH_MAX + 64];
+    snprintf(kb_path, sizeof(kb_path), "%s" PATH_SEP "plugin_keybinds", cfg->data_dir);
+    f = fopen(kb_path, "r");
+    if (f) {
+        fclose(f);
+        REPORT("[ok]  plugin keybinds file readable\n");
+    } else {
+        REPORT("[..]  no plugin keybind overrides\n");
+    }
+    PluginList exp_plugins = {NULL, 0, 0};
+    scan_addons_dir(&exp_plugins, cfg, cfg->addons_dir);
+    scan_addons_dir(&exp_plugins, cfg, "addons");
+    mark_plugin_keybind_conflicts(&exp_plugins, cfg);
+    for (size_t i = 0; i < exp_plugins.count; i++) {
+        Plugin *p = &exp_plugins.items[i];
+        if (p->is_compiled) {
+            REPORT("[ok]  plugin \"%s\" compiled\n", p->name);
+        } else {
+            REPORT("[!!]  plugin \"%s\" not compiled\n", p->name);
+            failed = 1;
+        }
+    }
+    plugin_list_free(&exp_plugins);
+    if (is_plugin_system_enabled(cfg)) {
+        REPORT("[ok]  plugin system enabled\n");
+    } else {
+        REPORT("[..]  plugin system disabled\n");
+    }
+    char session_path[PATH_MAX];
+    snprintf(session_path, sizeof(session_path), "%s" PATH_SEP "session", cfg->data_dir);
+    f = fopen(session_path, "r");
+    if (f) {
+        fclose(f);
+        REPORT("[ok]  session file present\n");
+    } else {
+        REPORT("[..]  no session file yet\n");
+    }
+
+    if (failed) {
+        REPORT("\nSome checks failed. Fix the [!!] items above.\n");
+    } else {
+        REPORT("\nAll checks passed.\n");
+    }
+    return failed;
+#undef REPORT
+}
+#endif
+
+#ifndef BLOB_TEST
+static void doctor_flow(AppState *state, const AppConfig *cfg) {
+    char report[4096];
+    build_doctor_report(cfg, report, sizeof(report));
+
+    clear_owned_region(state);
+    printf("%s\n", report);
+    printf("Press ESC/q to return...");
+    fflush(stdout);
+
+    KeyEvent k;
+    do { k = read_key(); } while (k.type == KEY_NONE);
+    state->rendered_lines = 0;
+}
+#endif
+
 static bool run_named_plugin(AppState *state, const AppConfig *cfg, const char *name) {
     PluginList plugins = {NULL, 0, 0};
     scan_addons_dir(&plugins, cfg, cfg->addons_dir);
@@ -3121,6 +3528,7 @@ static void keybindings_config_flow(AppState *state, AppConfig *cfg) {
         {"undo",       "Undo",        &cfg->key_undo},
         {"move_down",  "Move down",   &cfg->key_move_down},
         {"move_up",    "Move up",     &cfg->key_move_up},
+        {"view",       "Quick view",  &cfg->key_view},
     };
     size_t num_bindings = sizeof(bindings) / sizeof(bindings[0]);
     size_t sel = 0;
@@ -3139,7 +3547,7 @@ static void keybindings_config_flow(AppState *state, AppConfig *cfg) {
         size_t shown = 0;
         for (size_t i = start; i < num_bindings && shown < VISIBLE_NOTES; i++, shown++) {
             char line[128];
-            char key_str[4] = {bindings[i].field[0], '\0', '\0', '\0'};
+            char key_str[8] = {bindings[i].field[0], '\0', '\0', '\0', '\0', '\0', '\0', '\0'};
             if (bindings[i].field[0] == '\0') {
                 snprintf(key_str, sizeof(key_str), "?");
             } else if (bindings[i].field[0] == ' ') {
@@ -3266,6 +3674,38 @@ static void command_palette_flow(AppState *state, const AppConfig *cfg) {
         plugin_manager_flow(state, cfg);
     } else if (strcmp(command, "keys") == 0 || strcmp(command, "keybindings") == 0 || strcmp(command, "bindings") == 0) {
         keybindings_config_flow(state, (AppConfig *)cfg);
+    } else if (strcmp(command, "view") == 0 || strcmp(command, "preview") == 0) {
+        quick_view_flow(state, cfg);
+    } else if (strcmp(command, "doctor") == 0 || strcmp(command, "check") == 0) {
+        doctor_flow(state, cfg);
+    } else if (strcmp(command, "sort title") == 0 || strcmp(command, "sort name") == 0) {
+        g_sort_mode = SORT_TITLE;
+        snprintf(((AppConfig *)cfg)->sort_order, sizeof(((AppConfig *)cfg)->sort_order), "title");
+        save_config(cfg);
+        qsort(state->notes.items, state->notes.count, sizeof(*state->notes.items), note_cmp);
+        normalize_selection(state);
+        snprintf(state->status, sizeof(state->status), "Sort: title");
+    } else if (strcmp(command, "sort mtime") == 0 || strcmp(command, "sort time") == 0) {
+        g_sort_mode = SORT_MTIME;
+        snprintf(((AppConfig *)cfg)->sort_order, sizeof(((AppConfig *)cfg)->sort_order), "mtime");
+        save_config(cfg);
+        qsort(state->notes.items, state->notes.count, sizeof(*state->notes.items), note_cmp);
+        normalize_selection(state);
+        snprintf(state->status, sizeof(state->status), "Sort: mtime");
+    } else if (strcmp(command, "sort size") == 0) {
+        g_sort_mode = SORT_SIZE;
+        snprintf(((AppConfig *)cfg)->sort_order, sizeof(((AppConfig *)cfg)->sort_order), "size");
+        save_config(cfg);
+        qsort(state->notes.items, state->notes.count, sizeof(*state->notes.items), note_cmp);
+        normalize_selection(state);
+        snprintf(state->status, sizeof(state->status), "Sort: size");
+    } else if (strcmp(command, "sort reverse") == 0 || strcmp(command, "reverse") == 0) {
+        ((AppConfig *)cfg)->sort_reverse = !((AppConfig *)cfg)->sort_reverse;
+        g_sort_reverse = ((AppConfig *)cfg)->sort_reverse;
+        save_config(cfg);
+        qsort(state->notes.items, state->notes.count, sizeof(*state->notes.items), note_cmp);
+        normalize_selection(state);
+        snprintf(state->status, sizeof(state->status), "Sort reverse: %s", g_sort_reverse ? "on" : "off");
     } else if (strcmp(command, "quit") == 0 || strcmp(command, "q") == 0) {
         state->running = false;
     } else if (!run_named_plugin(state, cfg, command)) {
@@ -3275,37 +3715,125 @@ static void command_palette_flow(AppState *state, const AppConfig *cfg) {
 #endif
 
 static void undo_last_action(AppState *state, const AppConfig *cfg) {
-    if (state->undo.type == UNDO_NONE) {
+    if (state->undo_count == 0) {
         snprintf(state->status, sizeof(state->status), "Nothing to undo");
         return;
     }
 
-    switch (state->undo.type) {
+    UndoAction a = state->undo_stack[--state->undo_count];
+    bool ok = false;
+
+    switch (a.type) {
     case UNDO_TRASH:
-        if (rename(state->undo.current_path, state->undo.target_path) == 0) {
-            snprintf(state->status, sizeof(state->status), "Undid trash of \"%s\"", state->undo.title);
-        } else {
-            snprintf(state->status, sizeof(state->status), "Undo failed: %s", strerror(errno));
+        ok = rename(a.current_path, a.target_path) == 0;
+        if (ok) {
+            snprintf(state->status, sizeof(state->status), "Undid trash of \"%s\"", a.title);
         }
         break;
     case UNDO_RENAME:
-        if (rename(state->undo.current_path, state->undo.target_path) == 0) {
-            snprintf(state->status, sizeof(state->status), "Undid rename of \"%s\"", state->undo.title);
-        } else {
-            snprintf(state->status, sizeof(state->status), "Undo failed: %s", strerror(errno));
+        ok = rename(a.current_path, a.target_path) == 0;
+        if (ok) {
+            snprintf(state->status, sizeof(state->status), "Undid rename of \"%s\"", a.title);
         }
         break;
     default:
         break;
     }
 
-    state->undo.type = UNDO_NONE;
+    if (!ok) {
+        snprintf(state->status, sizeof(state->status), "Undo failed: %s", strerror(errno));
+        if (state->undo_count < MAX_UNDO) {
+            state->undo_stack[state->undo_count++] = a;
+        }
+        return;
+    }
+
+    if (state->redo_count >= MAX_UNDO) {
+        memmove(&state->redo_stack[0], &state->redo_stack[1],
+                (MAX_UNDO - 1) * sizeof(UndoAction));
+        state->redo_count = MAX_UNDO - 1;
+    }
+    state->redo_stack[state->redo_count++] = a;
+
+    load_notes(&state->notes, cfg);
+    load_favorites_for_list(&state->notes, cfg);
+    normalize_selection(state);
+}
+
+static void redo_last_action(AppState *state, const AppConfig *cfg) {
+    if (state->redo_count == 0) {
+        snprintf(state->status, sizeof(state->status), "Nothing to redo");
+        return;
+    }
+
+    UndoAction a = state->redo_stack[--state->redo_count];
+    bool ok = false;
+
+    switch (a.type) {
+    case UNDO_TRASH:
+        ok = rename(a.target_path, a.current_path) == 0;
+        if (ok) {
+            snprintf(state->status, sizeof(state->status), "Redid trash of \"%s\"", a.title);
+        }
+        break;
+    case UNDO_RENAME:
+        ok = rename(a.target_path, a.current_path) == 0;
+        if (ok) {
+            snprintf(state->status, sizeof(state->status), "Redid rename of \"%s\"", a.title);
+        }
+        break;
+    default:
+        break;
+    }
+
+    if (!ok) {
+        snprintf(state->status, sizeof(state->status), "Redo failed: %s", strerror(errno));
+        if (state->redo_count < MAX_UNDO) {
+            state->redo_stack[state->redo_count++] = a;
+        }
+        return;
+    }
+
+    if (state->undo_count >= MAX_UNDO) {
+        memmove(&state->undo_stack[0], &state->undo_stack[1],
+                (MAX_UNDO - 1) * sizeof(UndoAction));
+        state->undo_count = MAX_UNDO - 1;
+    }
+    state->undo_stack[state->undo_count++] = a;
+
     load_notes(&state->notes, cfg);
     load_favorites_for_list(&state->notes, cfg);
     normalize_selection(state);
 }
 
 #ifndef BLOB_TEST
+static void move_selection_paged(AppState *state, int pages) {
+    int n = pages * (int)VISIBLE_NOTES;
+    if (n > 0) {
+        for (int i = 0; i < n; i++) move_selection(state, 1);
+    } else {
+        for (int i = 0; i < -n; i++) move_selection(state, -1);
+    }
+}
+
+static void jump_to_first_note(AppState *state) {
+    for (size_t i = 0; i < state->notes.count; i++) {
+        if (note_visible(state, i)) {
+            state->selected = i;
+            return;
+        }
+    }
+}
+
+static void jump_to_last_note(AppState *state) {
+    for (size_t i = state->notes.count; i > 0; i--) {
+        if (note_visible(state, i - 1)) {
+            state->selected = i - 1;
+            return;
+        }
+    }
+}
+
 static void handle_key(AppState *state, const AppConfig *cfg, KeyEvent key) {
     if (key.type == KEY_UP) {
         move_selection(state, -1);
@@ -3315,13 +3843,29 @@ static void handle_key(AppState *state, const AppConfig *cfg, KeyEvent key) {
         move_selection(state, 1);
         return;
     }
-    // Vim-style navigation
-    if (key.type == KEY_CHAR && key.ch == cfg->key_move_up) {
-        move_selection(state, -1);
+    if (key.type == KEY_PGUP) {
+        move_selection_paged(state, -1);
         return;
     }
-    if (key.type == KEY_CHAR && key.ch == cfg->key_move_down) {
-        move_selection(state, 1);
+    if (key.type == KEY_PGDN) {
+        move_selection_paged(state, 1);
+        return;
+    }
+    if (key.type == KEY_HOME) {
+        jump_to_first_note(state);
+        return;
+    }
+    if (key.type == KEY_END) {
+        jump_to_last_note(state);
+        return;
+    }
+    if (key.type == KEY_CTRL_U) {
+        // Half-page scroll (vim style)
+        for (int i = 0; i < (int)VISIBLE_NOTES / 2; i++) move_selection(state, -1);
+        return;
+    }
+    if (key.type == KEY_CTRL_D) {
+        for (int i = 0; i < (int)VISIBLE_NOTES / 2; i++) move_selection(state, 1);
         return;
     }
     if (key.type == KEY_ENTER) {
@@ -3343,6 +3887,16 @@ static void handle_key(AppState *state, const AppConfig *cfg, KeyEvent key) {
         return;
     }
 
+    // Vim-style navigation (after search mode so j/k can be typed in search)
+    if (key.type == KEY_CHAR && key.ch == cfg->key_move_up) {
+        move_selection(state, -1);
+        return;
+    }
+    if (key.type == KEY_CHAR && key.ch == cfg->key_move_down) {
+        move_selection(state, 1);
+        return;
+    }
+
     if (key.type == KEY_CTRL_R) {
         show_reminders_flow(state, cfg);
         return;
@@ -3353,6 +3907,23 @@ static void handle_key(AppState *state, const AppConfig *cfg, KeyEvent key) {
     }
     if (key.type == KEY_CTRL_O) {
         state->show_help_expanded = !state->show_help_expanded;
+        return;
+    }
+    if (key.type == KEY_CTRL_Z) {
+        redo_last_action(state, cfg);
+        return;
+    }
+    if (key.type == KEY_CTRL_T) {
+        // Cycle sort order: mtime -> title -> size -> mtime
+        if (g_sort_mode == SORT_MTIME) g_sort_mode = SORT_TITLE;
+        else if (g_sort_mode == SORT_TITLE) g_sort_mode = SORT_SIZE;
+        else g_sort_mode = SORT_MTIME;
+        const char *name = g_sort_mode == SORT_TITLE ? "title" : g_sort_mode == SORT_SIZE ? "size" : "mtime";
+        snprintf(((AppConfig *)cfg)->sort_order, sizeof(((AppConfig *)cfg)->sort_order), "%s", name);
+        save_config(cfg);
+        qsort(state->notes.items, state->notes.count, sizeof(*state->notes.items), note_cmp);
+        normalize_selection(state);
+        snprintf(state->status, sizeof(state->status), "Sort: %s", name);
         return;
     }
 
@@ -3386,6 +3957,12 @@ static void handle_key(AppState *state, const AppConfig *cfg, KeyEvent key) {
         command_palette_flow(state, cfg);
     } else if (key.ch == cfg->key_undo) {
         undo_last_action(state, cfg);
+    } else if (key.ch == cfg->key_view) {
+        quick_view_flow(state, cfg);
+    } else if (key.ch == 'g') {
+        jump_to_first_note(state);
+    } else if (key.ch == 'G') {
+        jump_to_last_note(state);
     } else {
         if (is_plugin_system_enabled(cfg) && state->notes.count > 0 && selected_is_visible(state)) {
             PluginList temp_plugins = {NULL, 0, 0};
@@ -3428,7 +4005,16 @@ static void ui_loop(AppState *state, const AppConfig *cfg) {
 #endif
 
 #ifndef BLOB_TEST
-int main(void) {
+static int run_doctor_cli(const AppConfig *cfg) {
+    char report[4096];
+    int failed = build_doctor_report(cfg, report, sizeof(report));
+    printf("%s", report);
+    return failed;
+}
+#endif
+
+#ifndef BLOB_TEST
+int main(int argc, char **argv) {
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
@@ -3447,11 +4033,46 @@ int main(void) {
     init_paths(&cfg);
     load_config(&cfg);
     load_theme(&cfg);
+
+    // Non-interactive doctor mode: blob doctor
+    if (argc > 1 && strcmp(argv[1], "doctor") == 0) {
+        return run_doctor_cli(&cfg);
+    }
+
+    // Trash auto-purge before loading the list
+    if (cfg.purge_days > 0) {
+        int purged = purge_old_trashed_notes(&cfg, cfg.purge_days);
+        if (purged > 0) {
+            snprintf(state.status, sizeof(state.status),
+                     "Auto-purged %d trashed note(s) older than %d day(s)",
+                     purged, cfg.purge_days);
+        }
+    }
+
     if (!load_notes(&state.notes, &cfg)) {
         fprintf(stderr, "blob: failed to load notes\n");
         return 1;
     }
-    load_favorites_for_list(&state.notes, &cfg);    ui_loop(&state, &cfg);
+    load_favorites_for_list(&state.notes, &cfg);
+
+    // Session restore: select the last opened note if it still exists
+    char session_note[PATH_MAX];
+    if (load_session(&cfg, session_note, sizeof(session_note))) {
+        for (size_t i = 0; i < state.notes.count; i++) {
+            if (strcmp(state.notes.items[i].path, session_note) == 0) {
+                state.selected = i;
+                break;
+            }
+        }
+    }
+    normalize_selection(&state);
+
+    ui_loop(&state, &cfg);
+
+    // Persist session on exit
+    if (selected_is_visible(&state)) {
+        save_session(&cfg, state.notes.items[state.selected].path);
+    }
 
     exit_alt_screen();
     note_list_free(&state.notes);

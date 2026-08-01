@@ -3,6 +3,13 @@
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
+#ifdef _WIN32
+#include <sys/utime.h>
+#define utimbuf _utimbuf
+#define utime _utime
+#else
+#include <utime.h>
+#endif
 
 static void test_sanitize_slug(void) {
     char slug[TITLE_MAX];
@@ -202,12 +209,14 @@ static void test_files_are_different(void) {
 }
 
 static void test_undo_operations(void) {
-    /* Setup: create a temp file and set up undo state */
-    const char *test_file = "test_undo_note.md";
-    const char *trash_dir = ".trash_test";
+    /* Setup: create a temp notes dir and file */
+    const char *notes_dir = "test_undo_notes";
+    const char *test_file = "test_undo_notes/test-note.md";
+    const char *trash_dir = "test_undo_notes/.trash";
     char trash_path[PATH_MAX];
 
-    /* Create test file */
+    mkdir(notes_dir, 0755);
+
     FILE *f = fopen(test_file, "w");
     assert(f != NULL);
     fprintf(f, "# Test note\n");
@@ -216,50 +225,172 @@ static void test_undo_operations(void) {
     /* Create trash dir */
     mkdir(trash_dir, 0755);
 
-    /* Test undo trash */
-    snprintf(trash_path, sizeof(trash_path), "%s/%s", trash_dir, test_file);
-    rename(test_file, trash_path);
+    AppConfig cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    snprintf(cfg.notes_dir, sizeof(cfg.notes_dir), "%s", notes_dir);
+    snprintf(cfg.favorites_path, sizeof(cfg.favorites_path), "%s/favorites", notes_dir);
 
-    /* Simulate undo state */
     AppState state;
     memset(&state, 0, sizeof(state));
-    state.undo.type = UNDO_TRASH;
-    snprintf(state.undo.current_path, sizeof(state.undo.current_path), "%s", trash_path);
-    snprintf(state.undo.target_path, sizeof(state.undo.target_path), "%s", test_file);
-    snprintf(state.undo.title, sizeof(state.undo.title), "Test note");
 
-    /* Verify state before undo */
-    assert(state.undo.type == UNDO_TRASH);
+    /* Test trash undo + redo through the stack */
+    snprintf(trash_path, sizeof(trash_path), "%s/test-note.md", trash_dir);
+    assert(rename(test_file, trash_path) == 0);
+    push_undo(&state, UNDO_TRASH, trash_path, test_file, "Test note");
+
+    assert(state.undo_count == 1);
+    assert(state.redo_count == 0);
     assert(access(test_file, 0) != 0); /* original should be gone */
     assert(access(trash_path, 0) == 0); /* should be in trash */
 
-    /* Clean up trash */
-    remove(trash_path);
-    rmdir(trash_dir);
+    /* Undo restores the file */
+    undo_last_action(&state, &cfg);
+    assert(access(test_file, 0) == 0);
+    assert(access(trash_path, 0) != 0);
+    assert(state.undo_count == 0);
+    assert(state.redo_count == 1);
 
-    /* Test undo rename */
-    const char *old_name = "test_undo_old.md";
-    const char *new_name = "test_undo_new.md";
-    f = fopen(old_name, "w");
-    assert(f != NULL);
-    fprintf(f, "# Rename me\n");
-    fclose(f);
+    /* Redo moves it back to trash */
+    redo_last_action(&state, &cfg);
+    assert(access(test_file, 0) != 0);
+    assert(access(trash_path, 0) == 0);
+    assert(state.undo_count == 1);
+    assert(state.redo_count == 0);
 
-    rename(old_name, new_name);
+    /* A new action clears redo history */
+    assert(rename(trash_path, test_file) == 0);
+    push_undo(&state, UNDO_RENAME, test_file, test_file, "Test note");
+    assert(state.redo_count == 0);
 
-    state.undo.type = UNDO_RENAME;
-    snprintf(state.undo.current_path, sizeof(state.undo.current_path), "%s", new_name);
-    snprintf(state.undo.target_path, sizeof(state.undo.target_path), "%s", old_name);
-    snprintf(state.undo.title, sizeof(state.undo.title), "Rename me");
-
-    assert(state.undo.type == UNDO_RENAME);
-    assert(access(old_name, 0) != 0); /* original should be gone */
-    assert(access(new_name, 0) == 0); /* new should exist */
+    /* Undo stack depth is capped at MAX_UNDO */
+    for (int i = 0; i < MAX_UNDO + 5; i++) {
+        push_undo(&state, UNDO_TRASH, "a", "b", "x");
+    }
+    assert(state.undo_count == MAX_UNDO);
 
     /* Clean up */
-    remove(new_name);
+    remove(test_file);
+    remove(trash_path);
+    rmdir(trash_dir);
+    rmdir(notes_dir);
+    note_list_free(&state.notes);
 
     printf("test_undo_operations passed\n");
+}
+
+static void test_sort_modes(void) {
+    Note a, b, c;
+    memset(&a, 0, sizeof(a));
+    memset(&b, 0, sizeof(b));
+    memset(&c, 0, sizeof(c));
+
+    strcpy(a.title, "Alpha");
+    a.mtime = 100;
+    a.size = 50;
+    strcpy(b.title, "Beta");
+    b.mtime = 200;
+    b.size = 10;
+    strcpy(c.title, "Gamma");
+    c.mtime = 300;
+    c.size = 100;
+
+    /* Default: mtime descending (newest first) */
+    g_sort_mode = SORT_MTIME;
+    g_sort_reverse = false;
+    assert(note_cmp(&c, &a) < 0); /* c newer, sorts first */
+
+    /* Title ascending */
+    g_sort_mode = SORT_TITLE;
+    assert(note_cmp(&a, &b) < 0);
+    assert(note_cmp(&b, &a) > 0);
+
+    /* Title descending */
+    g_sort_reverse = true;
+    assert(note_cmp(&a, &b) > 0);
+    g_sort_reverse = false;
+
+    /* Size ascending */
+    g_sort_mode = SORT_SIZE;
+    assert(note_cmp(&b, &a) < 0); /* 10 < 50 */
+    assert(note_cmp(&c, &a) > 0); /* 100 > 50 */
+
+    /* Favorites always float to the top regardless of mode */
+    g_sort_mode = SORT_MTIME;
+    a.is_favorite = true;
+    assert(note_cmp(&a, &b) < 0);
+    a.is_favorite = false;
+
+    /* Reset globals for other tests */
+    g_sort_mode = SORT_MTIME;
+    g_sort_reverse = false;
+
+    printf("test_sort_modes passed\n");
+}
+
+static void test_purge_old_trashed_notes(void) {
+    const char *notes_dir = "test_purge_notes";
+    const char *trash_dir = "test_purge_notes/.trash";
+    mkdir(notes_dir, 0755);
+    mkdir(trash_dir, 0755);
+
+    /* Old note (30 days ago) and fresh note */
+    const char *old_file = "test_purge_notes/.trash/old.md";
+    const char *new_file = "test_purge_notes/.trash/new.md";
+
+    FILE *f = fopen(old_file, "w");
+    assert(f != NULL);
+    fprintf(f, "# Old\n");
+    fclose(f);
+    f = fopen(new_file, "w");
+    assert(f != NULL);
+    fprintf(f, "# New\n");
+    fclose(f);
+
+    /* Set old note's mtime to 30 days ago */
+    struct utimbuf ut;
+    ut.actime = time(NULL) - 30 * 86400;
+    ut.modtime = time(NULL) - 30 * 86400;
+    utime(old_file, &ut);
+
+    AppConfig cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    snprintf(cfg.notes_dir, sizeof(cfg.notes_dir), "%s", notes_dir);
+
+    /* purge_days = 7 should remove the old note but keep the fresh one */
+    int purged = purge_old_trashed_notes(&cfg, 7);
+    assert(purged == 1);
+    assert(access(old_file, 0) != 0);
+    assert(access(new_file, 0) == 0);
+
+    /* purge_days <= 0 disables purging */
+    assert(purge_old_trashed_notes(&cfg, 0) == 0);
+
+    remove(new_file);
+    rmdir(trash_dir);
+    rmdir(notes_dir);
+    printf("test_purge_old_trashed_notes passed\n");
+}
+
+static void test_session_roundtrip(void) {
+    const char *data_dir = "test_session_data";
+    mkdir(data_dir, 0755);
+
+    AppConfig cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    snprintf(cfg.data_dir, sizeof(cfg.data_dir), "%s", data_dir);
+
+    save_session(&cfg, "/tmp/notes/some-note.md");
+    char out[PATH_MAX];
+    assert(load_session(&cfg, out, sizeof(out)));
+    assert(strcmp(out, "/tmp/notes/some-note.md") == 0);
+
+    /* Empty path should clear the session */
+    save_session(&cfg, "");
+    assert(!load_session(&cfg, out, sizeof(out)));
+
+    remove("test_session_data/session");
+    rmdir(data_dir);
+    printf("test_session_roundtrip passed\n");
 }
 
 static void test_keybinding_defaults(void) {
@@ -281,6 +412,7 @@ static void test_keybinding_defaults(void) {
     cfg.key_undo = 'u';
     cfg.key_move_down = 'j';
     cfg.key_move_up = 'k';
+    cfg.key_view = 'v';
 
     assert(cfg.key_create == 'n');
     assert(cfg.key_rename == 'r');
@@ -296,6 +428,7 @@ static void test_keybinding_defaults(void) {
     assert(cfg.key_undo == 'u');
     assert(cfg.key_move_down == 'j');
     assert(cfg.key_move_up == 'k');
+    assert(cfg.key_view == 'v');
 
     printf("test_keybinding_defaults passed\n");
 }
@@ -311,6 +444,10 @@ static void test_keybinding_config_parsing(void) {
     fprintf(f, "key_move_down = j\n");
     fprintf(f, "key_move_up = k\n");
     fprintf(f, "key_undo = z\n");
+    fprintf(f, "key_view = p\n");
+    fprintf(f, "sort = title\n");
+    fprintf(f, "sort_reverse = true\n");
+    fprintf(f, "purge_days = 14\n");
     fclose(f);
 
     AppConfig cfg;
@@ -332,6 +469,9 @@ static void test_keybinding_config_parsing(void) {
     cfg.key_undo = 'u';
     cfg.key_move_down = 'j';
     cfg.key_move_up = 'k';
+    cfg.key_view = 'v';
+    cfg.purge_days = 30;
+    cfg.sort_reverse = false;
     snprintf(cfg.editor, sizeof(cfg.editor), "vim");
     snprintf(cfg.theme_name, sizeof(cfg.theme_name), "default");
     snprintf(cfg.sort_order, sizeof(cfg.sort_order), "mtime");
@@ -354,10 +494,20 @@ static void test_keybinding_config_parsing(void) {
     assert(cfg.key_quit == 'q');
     assert(cfg.key_move_down == 'j');
     assert(cfg.key_move_up == 'k');
+    assert(cfg.key_view == 'p');
 
     /* Verify other config was loaded */
     assert(strcmp(cfg.editor, "nvim") == 0);
     assert(strcmp(cfg.theme_name, "dracula") == 0);
+    assert(strcmp(cfg.sort_order, "title") == 0);
+    assert(g_sort_mode == SORT_TITLE);
+    assert(cfg.sort_reverse);
+    assert(g_sort_reverse);
+    assert(cfg.purge_days == 14);
+
+    /* Reset globals for other tests */
+    g_sort_mode = SORT_MTIME;
+    g_sort_reverse = false;
 
     remove(test_config);
     printf("test_keybinding_config_parsing passed\n");
@@ -407,6 +557,9 @@ int main(void) {
     test_unique_path_in_dir();
     test_files_are_different();
     test_undo_operations();
+    test_sort_modes();
+    test_purge_old_trashed_notes();
+    test_session_roundtrip();
     test_keybinding_defaults();
     test_keybinding_config_parsing();
     test_load_theme();

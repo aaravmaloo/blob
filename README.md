@@ -26,6 +26,13 @@
 - built-in themes — dark, light, dracula, solarized presets with a plugin switcher
 - relative timestamps and pagination
 - safer plugin installs with API, mode, and permission metadata
+- multi-level undo (`u`) and redo (`Ctrl+Z`) — undo up to 10 previous trash/rename actions
+- configurable sorting — `sort = mtime|title|size` with `Ctrl+T` cycling and reverse support
+- trash auto-purge (`purge_days`) — trashed notes older than N days are cleaned up on startup
+- `blob doctor` — run `blob doctor` (or `:doctor`) for a self-check of dirs, config, and plugins
+- session restore — re-selects the last opened note on launch
+- quick view (`v`) — read a note inline without opening your editor
+- vim-style navigation — `g`/`G` top/bottom, `PgUp`/`PgDn` page, `Ctrl+U`/`Ctrl+D` half-page
 - customizability
 
 ## Customizing blob
@@ -42,7 +49,10 @@ sort = mtime
 |----------|-------------|
 | `editor` | Overrides `$EDITOR` (default: `vim` on macOS/Linux, `notepad` on Windows) |
 | `theme`  | Color preset: `default`, `dark`, `light`, `dracula`, `solarized` |
-| `sort`   | Sort order (reserved for future use) |
+| `sort`   | Sort order: `mtime` (newest first), `title` (alphabetical), `size` |
+| `sort_reverse` | `true`/`false` — reverse the sort direction (favorites still float to top) |
+| `purge_days` | Auto-delete trashed notes older than this many days (`0` disables) |
+| `key_view` | Keybind for quick view mode (default: `v`) |
 
 You can also set the editor via the `EDITOR` environment variable — the config file takes precedence.
 
@@ -103,6 +113,12 @@ make release
 | `/` | Search notes |
 | `:` | Open command palette |
 | `p` | Open plugins manager |
+| `v` | Quick view note (read inline, `e` to edit) |
+| `g` / `G` | Jump to first / last note |
+| `PgUp` / `PgDn` | Scroll a full page |
+| `Ctrl+U` / `Ctrl+D` | Scroll half a page |
+| `Ctrl+T` | Cycle sort order (mtime → title → size) |
+| `Ctrl+Z` | Redo |
 | `Ctrl+R` | Show reminders |
 | `Esc` | Clear search |
 | `q` | Quit |
@@ -150,6 +166,18 @@ Windows:
 ```text
 %LOCALAPPDATA%\blob\notes
 ```
+
+## Philosophy
+
+## Diagnostics
+
+If something isn't working, run the built-in self-check:
+
+```sh
+blob doctor
+```
+
+It verifies your data dir, notes dir, config file, favorites, plugin keybind overrides, plugin compilation state, plugin system, and session file. Missing dirs or un-compiled plugins are reported with `[!!]` and the command exits non-zero. You can also run it from inside the TUI with the `:doctor` command palette entry.
 
 ## Philosophy
 
