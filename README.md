@@ -167,8 +167,6 @@ Windows:
 %LOCALAPPDATA%\blob\notes
 ```
 
-## Philosophy
-
 ## Diagnostics
 
 If something isn't working, run the built-in self-check:
