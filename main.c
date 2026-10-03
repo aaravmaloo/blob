@@ -32,6 +32,7 @@
 #define PATH_SEP "\\"
 #else
 #include <dirent.h>
+#include <sys/ioctl.h>
 #include <sys/select.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -62,7 +63,8 @@
 #define SEARCH_MAX 128
 #define TITLE_MAX 256
 #define INITIAL_NOTES_CAP 32
-#define VISIBLE_NOTES 12
+#define VISIBLE_NOTES ((size_t)g_visible_notes)
+#define DEFAULT_VISIBLE_NOTES 12
 #define MAX_UNDO 10
 #define QUICK_VIEW_LINES 12
 
@@ -88,6 +90,23 @@ typedef enum {
 static SortMode g_sort_mode = SORT_MTIME;
 static bool g_sort_reverse = false;
 
+typedef enum {
+    COLOR_MODE_AUTO = 0,
+    COLOR_MODE_TRUE,
+    COLOR_MODE_256
+} ColorMode;
+
+typedef enum {
+    PLUGIN_SOURCE_LOCAL = 0,
+    PLUGIN_SOURCE_ASK,
+    PLUGIN_SOURCE_GITHUB
+} PluginSource;
+
+// Mirrors of config settings read in places that do not receive the config
+static int g_visible_notes = DEFAULT_VISIBLE_NOTES;
+static bool g_date_absolute = false;
+static bool g_plugin_confirm_run = true;
+
 #define ANSI_RESET "\x1b[0m"
 #define ANSI_BOLD "\x1b[1m"
 #define ANSI_DIM "\x1b[2m"
@@ -97,23 +116,25 @@ static bool g_sort_reverse = false;
 #define ANSI_CLEAR_LINE "\x1b[2K"
 
 typedef struct {
-    char title[16];
-    char selected[16];
-    char search[16];
-    char help[16];
-    char status[16];
-    char timestamp[16];
-    char pagination[16];
+    char title[32];
+    char selected[32];
+    char search[32];
+    char help[32];
+    char status[32];
+    char timestamp[32];
+    char pagination[32];
+    char star[32];
 } Theme;
 
 static Theme g_theme = {
-    .title = "\x1b[36m",
-    .selected = "\x1b[32m",
-    .search = "\x1b[33m",
+    .title = "\x1b[39m",
+    .selected = "\x1b[36m",
+    .search = "\x1b[35m",
     .help = "\x1b[2m",
     .status = "\x1b[31m",
     .timestamp = "\x1b[90m",
     .pagination = "\x1b[90m",
+    .star = "\x1b[33m",
 };
 
 void enter_alt_screen(void) {
@@ -137,11 +158,23 @@ typedef struct {
     char sort_order[16];
     int purge_days;
     bool sort_reverse;
+    bool restore_session;
+    int visible_notes;
+    bool date_absolute;
+    ColorMode color_mode;
+    bool show_hints;
+    bool confirm_trash;
+    bool open_after_create;
+    PluginSource plugin_source;
+    bool plugin_confirm_run;
+    bool plugin_confirm_install;
+    bool plugin_scan_cwd;
+    char plugin_repo[128];
+    char plugin_branch[64];
     // Configurable keybindings (defaults set in init_paths)
     char key_create;
     char key_rename;
     char key_trash;
-    char key_delete;
     char key_trash_bin;
     char key_copy;
     char key_star;
@@ -208,7 +241,8 @@ typedef enum {
     KEY_HOME,
     KEY_END,
     KEY_PGUP,
-    KEY_PGDN
+    KEY_PGDN,
+    KEY_BACKTAB
 } KeyType;
 
 typedef struct {
@@ -428,6 +462,7 @@ static KeyEvent read_key(void) {
         else if (ext == 79) key.type = KEY_END;
         else if (ext == 73) key.type = KEY_PGUP;
         else if (ext == 81) key.type = KEY_PGDN;
+        else if (ext == 15) key.type = KEY_BACKTAB;
         return key;
     }
 
@@ -499,7 +534,7 @@ static KeyEvent read_key(void) {
         timeout.tv_usec = 100000;
 
         if (select(STDIN_FILENO + 1, &set, NULL, NULL, &timeout) <= 0 ||
-            read(STDIN_FILENO, &seq[0], 1) != 1) {
+            read(STDIN_FILENO, &seq[0], 1) != 1 || seq[0] == '\x1b') {
             key.type = KEY_ESCAPE;
             return key;
         }
@@ -521,6 +556,7 @@ static KeyEvent read_key(void) {
             else if (seq[1] == 'D') key.type = KEY_LEFT;
             else if (seq[1] == 'H') key.type = KEY_HOME;
             else if (seq[1] == 'F') key.type = KEY_END;
+            else if (seq[1] == 'Z') key.type = KEY_BACKTAB;
             else if (seq[1] == '5' || seq[1] == '6') {
                 // PgUp/PgDn arrive as ESC [ 5 ~ / ESC [ 6 ~ (3 bytes after ESC)
                 char seq2 = 0;
@@ -552,10 +588,7 @@ static void clear_owned_region(AppState *state) {
         return;
     }
 
-    printf("\r");
-    for (size_t i = 0; i < state->rendered_lines; i++) {
-        printf("\x1b[1A" ANSI_CLEAR_LINE "\r");
-    }
+    printf("\r\x1b[%zuA\x1b[J", state->rendered_lines);
     fflush(stdout);
     state->rendered_lines = 0;
 }
@@ -591,6 +624,25 @@ static bool ensure_dir(const char *path) {
 
     return mkdir(tmp, 0755) == 0 || errno == EEXIST;
 }
+
+static void set_default_keybindings(AppConfig *cfg) {
+    cfg->key_create = 'n';
+    cfg->key_rename = 'r';
+    cfg->key_trash = 'd';
+    cfg->key_trash_bin = 't';
+    cfg->key_copy = 'y';
+    cfg->key_star = '*';
+    cfg->key_search = '/';
+    cfg->key_cmd = ':';
+    cfg->key_plugins = 'p';
+    cfg->key_quit = 'q';
+    cfg->key_undo = 'u';
+    cfg->key_move_down = 'j';
+    cfg->key_move_up = 'k';
+    cfg->key_view = 'v';
+}
+
+static void set_config_defaults(AppConfig *cfg);
 
 #ifndef BLOB_TEST
 static void init_paths(AppConfig *cfg) {
@@ -632,23 +684,9 @@ static void init_paths(AppConfig *cfg) {
     snprintf(cfg->sort_order, sizeof(cfg->sort_order), "mtime");
     cfg->purge_days = 30;
     cfg->sort_reverse = false;
+    set_config_defaults(cfg);
 
-    // Default keybindings
-    cfg->key_create = 'n';
-    cfg->key_rename = 'r';
-    cfg->key_trash = 'd';
-    cfg->key_delete = 'D';
-    cfg->key_trash_bin = 't';
-    cfg->key_copy = 'y';
-    cfg->key_star = '*';
-    cfg->key_search = '/';
-    cfg->key_cmd = ':';
-    cfg->key_plugins = 'p';
-    cfg->key_quit = 'q';
-    cfg->key_undo = 'u';
-    cfg->key_move_down = 'j';
-    cfg->key_move_up = 'k';
-    cfg->key_view = 'v';
+    set_default_keybindings(cfg);
 
     // Initial setup diagnostics
     if (!ensure_dir(cfg->data_dir)) {
@@ -670,6 +708,61 @@ static SortMode sort_mode_from_string(const char *s) {
 }
 
 /* ── themes ──────────────────────────────────────────────────────────────── */
+
+static void set_config_defaults(AppConfig *cfg) {
+    cfg->restore_session = true;
+    cfg->visible_notes = DEFAULT_VISIBLE_NOTES;
+    cfg->date_absolute = false;
+    cfg->color_mode = COLOR_MODE_AUTO;
+    cfg->show_hints = true;
+    cfg->confirm_trash = true;
+    cfg->open_after_create = true;
+    cfg->plugin_source = PLUGIN_SOURCE_ASK;
+    cfg->plugin_confirm_run = true;
+    cfg->plugin_confirm_install = true;
+    cfg->plugin_scan_cwd = true;
+    snprintf(cfg->plugin_repo, sizeof(cfg->plugin_repo), "aaravmaloo/blob");
+    snprintf(cfg->plugin_branch, sizeof(cfg->plugin_branch), "master");
+    g_visible_notes = cfg->visible_notes;
+    g_date_absolute = cfg->date_absolute;
+    g_plugin_confirm_run = cfg->plugin_confirm_run;
+}
+
+/* Repo and branch names end up inside shell commands, so only allow URL-safe characters */
+static bool is_safe_url_part(const char *s) {
+    if (!s || !*s) return false;
+    for (const char *c = s; *c; c++) {
+        if (!(isalnum((unsigned char)*c) || *c == '-' || *c == '_' || *c == '.' || *c == '/')) {
+            return false;
+        }
+    }
+    return strstr(s, "..") == NULL && s[0] != '/' && s[0] != '-';
+}
+
+static bool parse_bool(const char *value) {
+    return strcmp(value, "true") == 0 || strcmp(value, "1") == 0 || strcmp(value, "yes") == 0 ||
+           strcmp(value, "on") == 0;
+}
+
+static const char *plugin_source_to_string(PluginSource source) {
+    switch (source) {
+    case PLUGIN_SOURCE_LOCAL:
+        return "local";
+    case PLUGIN_SOURCE_GITHUB:
+        return "github";
+    case PLUGIN_SOURCE_ASK:
+    default:
+        return "ask";
+    }
+}
+
+static PluginSource plugin_source_from_string(const char *s) {
+    if (strcmp(s, "local") == 0) return PLUGIN_SOURCE_LOCAL;
+    if (strcmp(s, "github") == 0) return PLUGIN_SOURCE_GITHUB;
+    return PLUGIN_SOURCE_ASK;
+}
+
+static const char *resolve_theme_name(const char *name);
 
 static void load_config(AppConfig *cfg) {
     FILE *f = fopen(cfg->config_path, "r");
@@ -705,23 +798,57 @@ static void load_config(AppConfig *cfg) {
         if (strcmp(key, "editor") == 0) {
             snprintf(cfg->editor, sizeof(cfg->editor), "%s", value);
         } else if (strcmp(key, "theme") == 0) {
-            snprintf(cfg->theme_name, sizeof(cfg->theme_name), "%s", value);
+            snprintf(cfg->theme_name, sizeof(cfg->theme_name), "%s", resolve_theme_name(value));
         } else if (strcmp(key, "sort") == 0) {
             snprintf(cfg->sort_order, sizeof(cfg->sort_order), "%s", value);
             g_sort_mode = sort_mode_from_string(cfg->sort_order);
         } else if (strcmp(key, "sort_reverse") == 0) {
-            cfg->sort_reverse = (strcmp(value, "true") == 0 ||
-                                 strcmp(value, "1") == 0 ||
-                                 strcmp(value, "yes") == 0);
+            cfg->sort_reverse = parse_bool(value);
             g_sort_reverse = cfg->sort_reverse;
         } else if (strcmp(key, "purge_days") == 0) {
             cfg->purge_days = atoi(value);
+        } else if (strcmp(key, "restore_session") == 0) {
+            cfg->restore_session = parse_bool(value);
+        } else if (strcmp(key, "visible_notes") == 0) {
+            int n = atoi(value);
+            if (n >= 3 && n <= 50) {
+                cfg->visible_notes = n;
+                g_visible_notes = n;
+            }
+        } else if (strcmp(key, "date_style") == 0) {
+            cfg->date_absolute = strcmp(value, "absolute") == 0;
+            g_date_absolute = cfg->date_absolute;
+        } else if (strcmp(key, "colors") == 0) {
+            cfg->color_mode = strcmp(value, "truecolor") == 0 ? COLOR_MODE_TRUE :
+                              strcmp(value, "256") == 0 ? COLOR_MODE_256 : COLOR_MODE_AUTO;
+        } else if (strcmp(key, "show_hints") == 0) {
+            cfg->show_hints = parse_bool(value);
+        } else if (strcmp(key, "confirm_trash") == 0) {
+            cfg->confirm_trash = parse_bool(value);
+        } else if (strcmp(key, "open_after_create") == 0) {
+            cfg->open_after_create = parse_bool(value);
+        } else if (strcmp(key, "plugin_source") == 0) {
+            cfg->plugin_source = plugin_source_from_string(value);
+        } else if (strcmp(key, "plugin_confirm_run") == 0) {
+            cfg->plugin_confirm_run = parse_bool(value);
+            g_plugin_confirm_run = cfg->plugin_confirm_run;
+        } else if (strcmp(key, "plugin_confirm_install") == 0) {
+            cfg->plugin_confirm_install = parse_bool(value);
+        } else if (strcmp(key, "plugin_scan_cwd") == 0) {
+            cfg->plugin_scan_cwd = parse_bool(value);
+        } else if (strcmp(key, "plugin_repo") == 0) {
+            if (is_safe_url_part(value)) {
+                snprintf(cfg->plugin_repo, sizeof(cfg->plugin_repo), "%s", value);
+            }
+        } else if (strcmp(key, "plugin_branch") == 0) {
+            if (is_safe_url_part(value)) {
+                snprintf(cfg->plugin_branch, sizeof(cfg->plugin_branch), "%s", value);
+            }
         } else if (strncmp(key, "key_", 4) == 0) {
             if (value[0]) {
                 if (strcmp(key + 4, "create") == 0) cfg->key_create = value[0];
                 else if (strcmp(key + 4, "rename") == 0) cfg->key_rename = value[0];
                 else if (strcmp(key + 4, "trash") == 0) cfg->key_trash = value[0];
-                else if (strcmp(key + 4, "delete") == 0) cfg->key_delete = value[0];
                 else if (strcmp(key + 4, "trash_bin") == 0) cfg->key_trash_bin = value[0];
                 else if (strcmp(key + 4, "copy") == 0) cfg->key_copy = value[0];
                 else if (strcmp(key + 4, "star") == 0) cfg->key_star = value[0];
@@ -748,10 +875,23 @@ static void save_config(const AppConfig *cfg) {
     fprintf(f, "sort = %s\n", cfg->sort_order);
     fprintf(f, "sort_reverse = %s\n", cfg->sort_reverse ? "true" : "false");
     fprintf(f, "purge_days = %d\n", cfg->purge_days);
+    fprintf(f, "restore_session = %s\n", cfg->restore_session ? "true" : "false");
+    fprintf(f, "visible_notes = %d\n", cfg->visible_notes);
+    fprintf(f, "date_style = %s\n", cfg->date_absolute ? "absolute" : "relative");
+    fprintf(f, "colors = %s\n", cfg->color_mode == COLOR_MODE_TRUE ? "truecolor" :
+                               cfg->color_mode == COLOR_MODE_256 ? "256" : "auto");
+    fprintf(f, "show_hints = %s\n", cfg->show_hints ? "true" : "false");
+    fprintf(f, "confirm_trash = %s\n", cfg->confirm_trash ? "true" : "false");
+    fprintf(f, "open_after_create = %s\n", cfg->open_after_create ? "true" : "false");
+    fprintf(f, "plugin_source = %s\n", plugin_source_to_string(cfg->plugin_source));
+    fprintf(f, "plugin_confirm_run = %s\n", cfg->plugin_confirm_run ? "true" : "false");
+    fprintf(f, "plugin_confirm_install = %s\n", cfg->plugin_confirm_install ? "true" : "false");
+    fprintf(f, "plugin_scan_cwd = %s\n", cfg->plugin_scan_cwd ? "true" : "false");
+    fprintf(f, "plugin_repo = %s\n", cfg->plugin_repo);
+    fprintf(f, "plugin_branch = %s\n", cfg->plugin_branch);
     fprintf(f, "key_create = %c\n", cfg->key_create);
     fprintf(f, "key_rename = %c\n", cfg->key_rename);
     fprintf(f, "key_trash = %c\n", cfg->key_trash);
-    fprintf(f, "key_delete = %c\n", cfg->key_delete);
     fprintf(f, "key_trash_bin = %c\n", cfg->key_trash_bin);
     fprintf(f, "key_copy = %c\n", cfg->key_copy);
     fprintf(f, "key_star = %c\n", cfg->key_star);
@@ -810,87 +950,135 @@ static void load_favorites_for_list(NoteList *list, const AppConfig *cfg) {
 
 /* ── themes ──────────────────────────────────────────────────────────────── */
 
+/* Colours are "#rrggbb" (drawn as 24-bit or the nearest of the 256 xterm colours)
+   or a raw escape, which follows the terminal's own palette */
 typedef struct {
     const char *name;
+    const char *description;
     const char *title;
     const char *selected;
     const char *search;
     const char *help;
     const char *status;
     const char *timestamp;
-    const char *pagination;
+    const char *star;
 } ThemePreset;
 
-static ThemePreset s_themes[] = {
-    {
-        .name = "default",
-        .title = "\x1b[36m",     // cyan
-        .selected = "\x1b[32m",  // green
-        .search = "\x1b[33m",    // yellow
-        .help = "\x1b[2m",       // dim
-        .status = "\x1b[31m",    // red
-        .timestamp = "\x1b[90m", // bright black
-        .pagination = "\x1b[90m",
-    },
-    {
-        .name = "dark",
-        .title = "\x1b[38;5;81m",   // soft blue
-        .selected = "\x1b[38;5;46m", // bright green
-        .search = "\x1b[38;5;220m",  // gold
-        .help = "\x1b[38;5;245m",    // grey
-        .status = "\x1b[38;5;196m",  // bright red
-        .timestamp = "\x1b[38;5;240m",
-        .pagination = "\x1b[38;5;240m",
-    },
-    {
-        .name = "light",
-        .title = "\x1b[34m",     // blue
-        .selected = "\x1b[32m",  // green
-        .search = "\x1b[33m",    // yellow
-        .help = "\x1b[90m",      // grey
-        .status = "\x1b[31m",    // red
-        .timestamp = "\x1b[2m",  // dim
-        .pagination = "\x1b[2m",
-    },
-    {
-        .name = "dracula",
-        .title = "\x1b[38;5;141m",  // purple
-        .selected = "\x1b[38;5;84m", // mint green
-        .search = "\x1b[38;5;215m",  // peach
-        .help = "\x1b[38;5;239m",    // dim grey
-        .status = "\x1b[38;5;203m",  // coral
-        .timestamp = "\x1b[38;5;242m",
-        .pagination = "\x1b[38;5;242m",
-    },
-    {
-        .name = "solarized",
-        .title = "\x1b[38;5;37m",   // teal
-        .selected = "\x1b[38;5;64m", // green
-        .search = "\x1b[38;5;136m",  // orange
-        .help = "\x1b[38;5;242m",    // grey
-        .status = "\x1b[38;5;160m",  // red
-        .timestamp = "\x1b[38;5;244m",
-        .pagination = "\x1b[38;5;244m",
-    },
+static const ThemePreset s_themes[] = {
+    {"default", "Your terminal's own colours", "\x1b[39m", "\x1b[36m", "\x1b[35m", "\x1b[2m", "\x1b[31m", "\x1b[90m", "\x1b[33m"},
+    {"mono", "No colour, bold and dim only", "\x1b[39m", "\x1b[39m", "\x1b[39m", "\x1b[2m", "\x1b[39m", "\x1b[2m", "\x1b[39m"},
+    {"catppuccin-mocha", "Dark - soft pastels on deep blue", "#cdd6f4", "#cba6f7", "#89b4fa", "#7f849c", "#f38ba8", "#7f849c", "#f9e2af"},
+    {"catppuccin-latte", "Light - pastels on pale grey", "#4c4f69", "#8839ef", "#1e66f5", "#6c6f85", "#d20f39", "#7c7f93", "#e64553"},
+    {"tokyo-night", "Dark - neon blue and violet", "#c0caf5", "#7aa2f7", "#bb9af7", "#737aa2", "#f7768e", "#737aa2", "#e0af68"},
+    {"tokyo-night-day", "Light - Tokyo Night in daylight", "#3760bf", "#2e7de9", "#9854f1", "#68709a", "#f52a65", "#68709a", "#8c6c3e"},
+    {"gruvbox-dark", "Dark - warm retro browns", "#ebdbb2", "#fe8019", "#8ec07c", "#a89984", "#fb4934", "#928374", "#fabd2f"},
+    {"gruvbox-light", "Light - warm retro on cream", "#3c3836", "#af3a03", "#427b58", "#7c6f64", "#9d0006", "#7c6f64", "#b57614"},
+    {"rose-pine", "Dark - muted rose and pine", "#e0def4", "#c4a7e7", "#9ccfd8", "#908caa", "#eb6f92", "#6e6a86", "#f6c177"},
+    {"rose-pine-dawn", "Light - rose and pine at dawn", "#575279", "#286983", "#907aa9", "#797593", "#b4637a", "#797593", "#b4637a"},
+    {"dracula", "Dark - purple and pink", "#f8f8f2", "#bd93f9", "#ff79c6", "#6272a4", "#ff5555", "#6272a4", "#f1fa8c"},
+    {"alucard", "Light - Dracula's light twin", "#1f1f1f", "#644ac9", "#a3144d", "#635d97", "#cb3a2a", "#635d97", "#846e15"},
+    {"solarized-dark", "Dark - classic Solarized", "#93a1a1", "#268bd2", "#2aa198", "#657b83", "#dc322f", "#657b83", "#b58900"},
+    {"solarized-light", "Light - classic Solarized", "#073642", "#268bd2", "#d33682", "#657b83", "#dc322f", "#657b83", "#cb4b16"},
+    {"everforest", "Dark - calm forest greens", "#d3c6aa", "#a7c080", "#7fbbb3", "#859289", "#e67e80", "#859289", "#dbbc7f"},
+    {"everforest-light", "Light - forest on parchment", "#5c6a72", "#3a94c5", "#3a94c5", "#829181", "#f85552", "#829181", "#f85552"},
+    {"kanagawa", "Dark - ink and wave blues", "#dcd7ba", "#7e9cd8", "#957fb8", "#727169", "#e46876", "#727169", "#e6c384"},
+    {"kanagawa-lotus", "Light - ink on rice paper", "#545464", "#4d699b", "#624c83", "#716e61", "#c84053", "#716e61", "#cc6d00"},
+    {"one-dark", "Dark - Atom's One Dark", "#abb2bf", "#61afef", "#c678dd", "#7f848e", "#e06c75", "#7f848e", "#e5c07b"},
+    {"one-light", "Light - Atom's One Light", "#383a42", "#4078f2", "#a626a4", "#696c77", "#e45649", "#696c77", "#c18401"},
+    {"nord", "Dark - arctic frost blues", "#d8dee9", "#88c0d0", "#b48ead", "#7b88a1", "#bf616a", "#7b88a1", "#ebcb8b"},
+};
+
+static const char *s_theme_aliases[][2] = {
+    {"dark", "tokyo-night"},
+    {"light", "catppuccin-latte"},
+    {"solarized", "solarized-dark"},
 };
 
 static const size_t s_theme_count = sizeof(s_themes) / sizeof(s_themes[0]);
 
+static const char *resolve_theme_name(const char *name) {
+    for (size_t i = 0; i < sizeof(s_theme_aliases) / sizeof(s_theme_aliases[0]); i++) {
+        if (strcmp(s_theme_aliases[i][0], name) == 0) {
+            return s_theme_aliases[i][1];
+        }
+    }
+    return name;
+}
+
+static bool terminal_supports_true_color(void) {
+    const char *colorterm = getenv("COLORTERM");
+    if (colorterm && (strstr(colorterm, "truecolor") || strstr(colorterm, "24bit"))) {
+        return true;
+    }
+    const char *term = getenv("TERM");
+    if (term && (strstr(term, "kitty") || strstr(term, "alacritty") || strstr(term, "ghostty") ||
+                 strstr(term, "wezterm") || strstr(term, "direct"))) {
+        return true;
+    }
+    const char *program = getenv("TERM_PROGRAM");
+    if (program && (strcmp(program, "iTerm.app") == 0 || strcmp(program, "WezTerm") == 0 ||
+                    strcmp(program, "vscode") == 0 || strcmp(program, "ghostty") == 0)) {
+        return true;
+    }
+    return getenv("WT_SESSION") != NULL;
+}
+
+static int rgb_to_xterm256(int r, int g, int b) {
+    static const int levels[6] = {0, 95, 135, 175, 215, 255};
+    int idx[3];
+    int rgb[3] = {r, g, b};
+    for (int c = 0; c < 3; c++) {
+        int best = 0;
+        for (int i = 1; i < 6; i++) {
+            if (abs(levels[i] - rgb[c]) < abs(levels[best] - rgb[c])) best = i;
+        }
+        idx[c] = best;
+    }
+    int cube_r = levels[idx[0]], cube_g = levels[idx[1]], cube_b = levels[idx[2]];
+    long cube_dist = (long)(cube_r - r) * (cube_r - r) + (long)(cube_g - g) * (cube_g - g) + (long)(cube_b - b) * (cube_b - b);
+
+    int avg = (r + g + b) / 3;
+    int grey_i = avg < 8 ? 0 : (avg > 238 ? 23 : (avg - 8 + 5) / 10);
+    int grey = 8 + grey_i * 10;
+    long grey_dist = (long)(grey - r) * (grey - r) + (long)(grey - g) * (grey - g) + (long)(grey - b) * (grey - b);
+
+    if (grey_dist < cube_dist) return 232 + grey_i;
+    return 16 + 36 * idx[0] + 6 * idx[1] + idx[2];
+}
+
+static void color_to_sgr(const char *src, bool true_color, char *dst, size_t dst_size) {
+    unsigned int r, g, b;
+    if (src[0] == '#' && sscanf(src + 1, "%02x%02x%02x", &r, &g, &b) == 3) {
+        if (true_color) {
+            snprintf(dst, dst_size, "\x1b[38;2;%u;%u;%um", r, g, b);
+        } else {
+            snprintf(dst, dst_size, "\x1b[38;5;%dm", rgb_to_xterm256((int)r, (int)g, (int)b));
+        }
+        return;
+    }
+    snprintf(dst, dst_size, "%s", src);
+}
+
 static void load_theme(const AppConfig *cfg) {
-    // Find the named preset
+    const char *name = resolve_theme_name(cfg->theme_name);
+    bool true_color = cfg->color_mode == COLOR_MODE_TRUE ||
+                      (cfg->color_mode == COLOR_MODE_AUTO && terminal_supports_true_color());
+
     for (size_t i = 0; i < s_theme_count; i++) {
-        if (strcmp(s_themes[i].name, cfg->theme_name) == 0) {
-            snprintf(g_theme.title, sizeof(g_theme.title), "%s", s_themes[i].title);
-            snprintf(g_theme.selected, sizeof(g_theme.selected), "%s", s_themes[i].selected);
-            snprintf(g_theme.search, sizeof(g_theme.search), "%s", s_themes[i].search);
-            snprintf(g_theme.help, sizeof(g_theme.help), "%s", s_themes[i].help);
-            snprintf(g_theme.status, sizeof(g_theme.status), "%s", s_themes[i].status);
-            snprintf(g_theme.timestamp, sizeof(g_theme.timestamp), "%s", s_themes[i].timestamp);
-            snprintf(g_theme.pagination, sizeof(g_theme.pagination), "%s", s_themes[i].pagination);
+        if (strcmp(s_themes[i].name, name) == 0) {
+            const ThemePreset *t = &s_themes[i];
+            color_to_sgr(t->title, true_color, g_theme.title, sizeof(g_theme.title));
+            color_to_sgr(t->selected, true_color, g_theme.selected, sizeof(g_theme.selected));
+            color_to_sgr(t->search, true_color, g_theme.search, sizeof(g_theme.search));
+            color_to_sgr(t->help, true_color, g_theme.help, sizeof(g_theme.help));
+            color_to_sgr(t->status, true_color, g_theme.status, sizeof(g_theme.status));
+            color_to_sgr(t->timestamp, true_color, g_theme.timestamp, sizeof(g_theme.timestamp));
+            color_to_sgr(t->timestamp, true_color, g_theme.pagination, sizeof(g_theme.pagination));
+            color_to_sgr(t->star, true_color, g_theme.star, sizeof(g_theme.star));
             return;
         }
     }
-    // Fallback: keep default g_theme values (already initialized statically)
+    // Unknown names keep the current colours
 }
 
 #ifndef _WIN32
@@ -1227,51 +1415,163 @@ static void render_line(AppState *state, const char *text) {
 
 static void format_relative_time(time_t mtime, char *buf, size_t buf_size);
 
+#define TITLE_COL_MIN 16
+#define TITLE_COL_MAX 48
+#define TIME_COL 7
+#define TIME_COL_ABSOLUTE 12
+
+/* Copies src into dst as exactly width columns, cutting with an ellipsis or padding with spaces */
+static void fit_column(char *dst, size_t dst_size, const char *src, size_t width) {
+    size_t total = 0;
+    for (const unsigned char *p = (const unsigned char *)src; *p; p++) {
+        if ((*p & 0xC0) != 0x80) total++;
+    }
+
+    size_t keep = total <= width ? total : (width > 0 ? width - 1 : 0);
+    size_t out = 0;
+    size_t cols = 0;
+    for (const unsigned char *p = (const unsigned char *)src; *p && out + 1 < dst_size; p++) {
+        if ((*p & 0xC0) != 0x80) {
+            if (cols == keep) break;
+            cols++;
+        }
+        dst[out++] = (char)*p;
+    }
+
+    if (total > width && width > 0 && out + 4 < dst_size) {
+        memcpy(dst + out, "\xe2\x80\xa6", 3);
+        out += 3;
+        cols++;
+    }
+    while (cols < width && out + 1 < dst_size) {
+        dst[out++] = ' ';
+        cols++;
+    }
+    dst[out] = '\0';
+}
+
+static const char *sort_label(void) {
+    switch (g_sort_mode) {
+    case SORT_TITLE:
+        return g_sort_reverse ? "z-a" : "a-z";
+    case SORT_SIZE:
+        return g_sort_reverse ? "largest first" : "smallest first";
+    case SORT_MTIME:
+    default:
+        return g_sort_reverse ? "oldest first" : "newest first";
+    }
+}
+
+static int terminal_columns(void) {
+#ifdef _WIN32
+    CONSOLE_SCREEN_BUFFER_INFO info;
+    if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &info)) {
+        return info.srWindow.Right - info.srWindow.Left + 1;
+    }
+#else
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) {
+        return ws.ws_col;
+    }
+#endif
+    return 80;
+}
+
+static void append_hint(char *buf, size_t buf_size, const char *key, const char *label) {
+    size_t len = strlen(buf);
+    if (len >= buf_size) return;
+    snprintf(buf + len, buf_size - len, "%s" ANSI_BOLD "%s" ANSI_RESET "%s %s" ANSI_RESET,
+             len ? "  " : "", key, g_theme.help, label);
+}
+
+static void append_key_hint(char *buf, size_t buf_size, char key, const char *label) {
+    char k[2] = {key, '\0'};
+    append_hint(buf, buf_size, k, label);
+}
+
+static void start_hint_group(char *buf, size_t buf_size, const char *group) {
+    snprintf(buf, buf_size, "%s%-7s" ANSI_RESET, g_theme.help, group);
+}
+
 #ifndef BLOB_TEST
 static void render_plugin_keybinds_help(AppState *state, const AppConfig *cfg);
 static void render_ui(AppState *state, const AppConfig *cfg) {
     normalize_selection(state);
     clear_owned_region(state);
 
-    render_line(state, ANSI_BOLD "blob v" BLOB_VERSION ANSI_RESET);
+    size_t total_visible = visible_count(state);
+    size_t total_notes = state->notes.count;
+
+    char header[256];
+    if (total_visible != total_notes) {
+        snprintf(header, sizeof(header),
+                 ANSI_BOLD "blob" ANSI_RESET "%s v" BLOB_VERSION "  \xc2\xb7  %zu of %zu notes  \xc2\xb7  %s" ANSI_RESET,
+                 g_theme.help, total_visible, total_notes, sort_label());
+    } else {
+        snprintf(header, sizeof(header),
+                 ANSI_BOLD "blob" ANSI_RESET "%s v" BLOB_VERSION "  \xc2\xb7  %zu %s  \xc2\xb7  %s" ANSI_RESET,
+                 g_theme.help, total_notes, total_notes == 1 ? "note" : "notes", sort_label());
+    }
+    render_line(state, header);
     render_line(state, "");
 
     if (state->search_mode || state->search[0]) {
-        char line[SEARCH_MAX + 16];
-        snprintf(line, sizeof(line), "%sSearch: %s%s", g_theme.search, state->search, ANSI_RESET);
+        char line[SEARCH_MAX + 32];
+        snprintf(line, sizeof(line), "%s/ %s%s", g_theme.search, state->search, ANSI_RESET);
         render_line(state, line);
         render_line(state, "");
     }
 
-    size_t shown = 0;
-    size_t total_visible = visible_count(state);
+    int cols = terminal_columns();
+    int time_w = g_date_absolute ? TIME_COL_ABSOLUTE : TIME_COL;
+    int row_chrome = 6 + time_w;
+    size_t title_w = cols > row_chrome + TITLE_COL_MIN ? (size_t)(cols - row_chrome - 1) : TITLE_COL_MIN;
+    if (title_w > TITLE_COL_MAX) title_w = TITLE_COL_MAX;
 
-    if (state->notes.count == 0) {
-        render_line(state, ANSI_DIM "no notes yet" ANSI_RESET);
+    size_t shown = 0;
+
+    if (total_notes == 0) {
+        char line[128];
+        snprintf(line, sizeof(line), "%s  no notes yet, press %c to create one%s",
+                 g_theme.help, cfg->key_create, ANSI_RESET);
+        render_line(state, line);
     } else if (total_visible == 0) {
-        render_line(state, ANSI_DIM "no matching notes" ANSI_RESET);
+        char line[64];
+        snprintf(line, sizeof(line), "%s  no matching notes%s", g_theme.help, ANSI_RESET);
+        render_line(state, line);
     } else {
         size_t start = first_rendered_note(state);
-        for (size_t i = start; i < state->notes.count && shown < VISIBLE_NOTES; i++) {
+        for (size_t i = start; i < total_notes && shown < VISIBLE_NOTES; i++) {
             if (!note_visible(state, i)) {
                 continue;
             }
 
-            char time_buf[32];
-            format_relative_time(state->notes.items[i].mtime, time_buf, sizeof(time_buf));
+            const Note *note = &state->notes.items[i];
+            bool selected = i == state->selected;
 
-            char line[TITLE_MAX + 64];
-            const char *prefix = i == state->selected ? g_theme.selected : "";
-            const char *star = state->notes.items[i].is_favorite ? "\x1b[33m\xe2\x98\x85\x1b[0m " : "  ";
-            snprintf(line, sizeof(line), "%s> %s%s%-38s%s %s%s%s",
-                     prefix,
-                     star,
-                     g_theme.title,
-                     state->notes.items[i].title,
-                     ANSI_RESET,
-                     g_theme.timestamp,
-                     time_buf,
-                     ANSI_RESET);
+            char time_buf[32];
+            format_relative_time(note->mtime, time_buf, sizeof(time_buf));
+
+            char title[TITLE_COL_MAX * 4 + 8];
+            fit_column(title, sizeof(title), note->title, title_w);
+
+            char star[32];
+            if (note->is_favorite) {
+                snprintf(star, sizeof(star), "%s\xe2\x98\x85" ANSI_RESET " ", g_theme.star);
+            } else {
+                snprintf(star, sizeof(star), "  ");
+            }
+
+            char line[sizeof(title) + 128];
+            if (selected) {
+                snprintf(line, sizeof(line), "%s\xe2\x96\x8c" ANSI_RESET " %s" ANSI_BOLD "%s%s" ANSI_RESET "  %s%*s" ANSI_RESET,
+                         g_theme.selected, star, g_theme.selected, title,
+                         g_theme.timestamp, time_w, time_buf);
+            } else {
+                snprintf(line, sizeof(line), "  %s%s%s" ANSI_RESET "  %s%*s" ANSI_RESET,
+                         star, g_theme.title, title,
+                         g_theme.timestamp, time_w, time_buf);
+            }
             render_line(state, line);
             shown++;
         }
@@ -1280,75 +1580,96 @@ static void render_ui(AppState *state, const AppConfig *cfg) {
     if (total_visible > VISIBLE_NOTES) {
         size_t start = first_rendered_note(state);
         size_t visible_before_start = 0;
-        for (size_t i = 0; i < start && i < state->notes.count; i++) {
+        for (size_t i = 0; i < start && i < total_notes; i++) {
             if (note_visible(state, i)) visible_before_start++;
         }
-        size_t end_visible = visible_before_start + shown;
         char page_info[64];
-        snprintf(page_info, sizeof(page_info), "%sShowing %zu-%zu of %zu%s", g_theme.pagination, visible_before_start + 1, end_visible, total_visible, ANSI_RESET);
+        snprintf(page_info, sizeof(page_info), "%s  %zu-%zu of %zu" ANSI_RESET, g_theme.pagination,
+                 visible_before_start + 1, visible_before_start + shown, total_visible);
         render_line(state, page_info);
     }
 
-    render_line(state, "");
-    render_line(state, ANSI_DIM "────────────────────────────────" ANSI_RESET);
-    render_line(state, "");
-
-    char help_line[128];
-    if (state->search_mode) {
-        snprintf(help_line, sizeof(help_line), "%s[ENTER] open%s", g_theme.help, ANSI_RESET);
-        render_line(state, help_line);
-        snprintf(help_line, sizeof(help_line), "%s[ESC] clear search%s", g_theme.help, ANSI_RESET);
-        render_line(state, help_line);
-        snprintf(help_line, sizeof(help_line), "%s[%c] quit%s", g_theme.help, cfg->key_quit, ANSI_RESET);
-        render_line(state, help_line);
-    } else {
-        if (state->show_help_expanded) {
-            /* ── Core keybinds ── */
-            snprintf(help_line, sizeof(help_line), "%s─── %sCore%s ───", g_theme.help, g_theme.title, ANSI_RESET);
-            render_line(state, help_line);
-            snprintf(help_line, sizeof(help_line), "%s[%c] new  [%c] rename  [%c] trash  [%c] delete%s", g_theme.help,
-                     cfg->key_create, cfg->key_rename, cfg->key_trash, cfg->key_delete, ANSI_RESET);
-            render_line(state, help_line);
-            snprintf(help_line, sizeof(help_line), "%s[%c] bin  [%c] copy  [%c] star  [%c] search%s", g_theme.help,
-                     cfg->key_trash_bin, cfg->key_copy, cfg->key_star, cfg->key_search, ANSI_RESET);
-            render_line(state, help_line);
-            snprintf(help_line, sizeof(help_line), "%s[%c] cmd  [%c] plugins  [%c] undo  [%c/%c] nav  [%c] quit%s", g_theme.help,
-                     cfg->key_cmd, cfg->key_plugins, cfg->key_undo,
-                     cfg->key_move_up, cfg->key_move_down, cfg->key_quit, ANSI_RESET);
-            render_line(state, help_line);
-            snprintf(help_line, sizeof(help_line), "%s[%c] view  [g/G] top/bottom  [PgUp/PgDn] page%s", g_theme.help,
-                     cfg->key_view, ANSI_RESET);
-            render_line(state, help_line);
-
-            /* ── Ctrl shortcuts ── */
-            snprintf(help_line, sizeof(help_line), "%s─── %sCtrl%s ───", g_theme.help, g_theme.title, ANSI_RESET);
-            render_line(state, help_line);
-            snprintf(help_line, sizeof(help_line), "%s[Ctrl+R] remind  [Ctrl+K] change keys  [Ctrl+O] less  [Ctrl+T] sort  [Ctrl+Z] redo%s", g_theme.help, ANSI_RESET);
-            render_line(state, help_line);
-
-            /* ── Plugin keybinds ── */
-            render_plugin_keybinds_help(state, cfg);
-        } else {
-            /* Show 4 action keybinding lines (one per line) + core keys */
-            snprintf(help_line, sizeof(help_line), "%s[%c/%c] navigate%s", g_theme.help,
-                     cfg->key_move_up, cfg->key_move_down, ANSI_RESET);
-            render_line(state, help_line);
-            snprintf(help_line, sizeof(help_line), "%s[%c] new%s", g_theme.help, cfg->key_create, ANSI_RESET);
-            render_line(state, help_line);
-            snprintf(help_line, sizeof(help_line), "%s[%c] rename%s", g_theme.help, cfg->key_rename, ANSI_RESET);
-            render_line(state, help_line);
-            snprintf(help_line, sizeof(help_line), "%s[%c] trash  [%c] delete%s", g_theme.help,
-                     cfg->key_trash, cfg->key_delete, ANSI_RESET);
-            render_line(state, help_line);
-            snprintf(help_line, sizeof(help_line), "%s[%c] bin  [%c] search  [%c] view%s", g_theme.help,
-                     cfg->key_trash_bin, cfg->key_search, cfg->key_view, ANSI_RESET);
-            render_line(state, help_line);
-            snprintf(help_line, sizeof(help_line), "%s[g/G] top/bottom  [Ctrl+U/D] half-page  [Ctrl+Z] redo%s", g_theme.help, ANSI_RESET);
-            render_line(state, help_line);
-            snprintf(help_line, sizeof(help_line), "%s[Ctrl+O] more  [Ctrl+R] remind  [Ctrl+K] keys  [Ctrl+T] sort  [%c] quit%s", g_theme.help,
-                     cfg->key_quit, ANSI_RESET);
-            render_line(state, help_line);
+    if (!state->search_mode && !state->show_help_expanded && !cfg->show_hints) {
+        if (state->status[0]) {
+            render_line(state, "");
+            char status_line[INPUT_MAX + 16];
+            snprintf(status_line, sizeof(status_line), "%s%s%s", g_theme.status, state->status, ANSI_RESET);
+            render_line(state, status_line);
+            state->status[0] = '\0';
         }
+        fflush(stdout);
+        return;
+    }
+
+    render_line(state, "");
+
+    char hints[1024];
+    char nav[8];
+    snprintf(nav, sizeof(nav), "%c/%c", cfg->key_move_up, cfg->key_move_down);
+
+    if (state->search_mode) {
+        hints[0] = '\0';
+        append_hint(hints, sizeof(hints), "enter", "open");
+        append_hint(hints, sizeof(hints), "esc", "clear");
+        append_hint(hints, sizeof(hints), "\xe2\x86\x91\xe2\x86\x93", "move");
+        render_line(state, hints);
+    } else if (state->show_help_expanded) {
+        start_hint_group(hints, sizeof(hints), "notes");
+        append_key_hint(hints, sizeof(hints), cfg->key_create, "new");
+        append_key_hint(hints, sizeof(hints), cfg->key_rename, "rename");
+        append_key_hint(hints, sizeof(hints), cfg->key_trash, "trash");
+        append_key_hint(hints, sizeof(hints), cfg->key_copy, "copy path");
+        append_key_hint(hints, sizeof(hints), cfg->key_star, "star");
+        append_key_hint(hints, sizeof(hints), cfg->key_view, "view");
+        render_line(state, hints);
+
+        start_hint_group(hints, sizeof(hints), "move");
+        append_hint(hints, sizeof(hints), nav, "up/down");
+        append_hint(hints, sizeof(hints), "g/G", "top/bottom");
+        append_hint(hints, sizeof(hints), "PgUp/PgDn", "page");
+        append_hint(hints, sizeof(hints), "^U/^D", "half page");
+        render_line(state, hints);
+
+        start_hint_group(hints, sizeof(hints), "more");
+        append_key_hint(hints, sizeof(hints), cfg->key_search, "search");
+        append_key_hint(hints, sizeof(hints), cfg->key_trash_bin, "bin");
+        append_key_hint(hints, sizeof(hints), cfg->key_undo, "undo");
+        append_hint(hints, sizeof(hints), "^Z", "redo");
+        append_key_hint(hints, sizeof(hints), cfg->key_cmd, "commands");
+        append_key_hint(hints, sizeof(hints), cfg->key_plugins, "plugins");
+        append_hint(hints, sizeof(hints), ",", "settings");
+        render_line(state, hints);
+
+        start_hint_group(hints, sizeof(hints), "ctrl");
+        append_hint(hints, sizeof(hints), "^R", "reminders");
+        append_hint(hints, sizeof(hints), "^K", "keybinds");
+        append_hint(hints, sizeof(hints), "^T", "sort");
+        append_hint(hints, sizeof(hints), "?", "less");
+        append_key_hint(hints, sizeof(hints), cfg->key_quit, "quit");
+        render_line(state, hints);
+
+        render_plugin_keybinds_help(state, cfg);
+    } else {
+        struct { char key; const char *label; } bar[] = {
+            {cfg->key_create, "new"},
+            {cfg->key_rename, "rename"},
+            {cfg->key_trash, "trash"},
+            {cfg->key_search, "search"},
+            {cfg->key_view, "view"},
+            {cfg->key_cmd, "cmd"},
+        };
+        size_t budget = cols > 1 ? (size_t)cols - 1 : 0;
+        size_t width = strlen("? help  q quit");
+        hints[0] = '\0';
+        for (size_t i = 0; i < sizeof(bar) / sizeof(bar[0]); i++) {
+            size_t entry_width = 1 + 1 + strlen(bar[i].label) + 2;
+            if (width + entry_width > budget) break;
+            append_key_hint(hints, sizeof(hints), bar[i].key, bar[i].label);
+            width += entry_width;
+        }
+        append_hint(hints, sizeof(hints), "?", "help");
+        append_key_hint(hints, sizeof(hints), cfg->key_quit, "quit");
+        render_line(state, hints);
     }
 
     if (state->status[0]) {
@@ -1365,18 +1686,52 @@ static void render_ui(AppState *state, const AppConfig *cfg) {
 
 static bool prompt_text(AppState *state, const char *label, char *buffer, size_t buffer_size) {
     clear_owned_region(state);
-    disable_raw_mode();
 
-    printf("? %s\n> ", label);
-    fflush(stdout);
+    printf("? %s  %s(enter to confirm, esc to cancel)" ANSI_RESET "\n", label, g_theme.help);
+    state->rendered_lines = 1;
+    printf(ANSI_SHOW_CURSOR);
 
-    bool ok = fgets(buffer, (int)buffer_size, stdin) != NULL;
-    if (ok) {
-        buffer[strcspn(buffer, "\r\n")] = '\0';
+    size_t len = 0;
+    buffer[0] = '\0';
+    bool confirmed = false;
+    bool done = false;
+
+    while (!done) {
+        printf("\r" ANSI_CLEAR_LINE "> %s", buffer);
+        fflush(stdout);
+
+        KeyEvent key = read_key();
+        if (key.type == KEY_ENTER) {
+            confirmed = true;
+            done = true;
+        } else if (key.type == KEY_ESCAPE || key.type == KEY_CTRL_C) {
+            done = true;
+        } else if (key.type == KEY_BACKSPACE) {
+            while (len > 0 && (((unsigned char)buffer[len - 1]) & 0xC0) == 0x80) {
+                len--;
+            }
+            if (len > 0) {
+                len--;
+            }
+            buffer[len] = '\0';
+        } else if (key.type == KEY_CTRL_U) {
+            len = 0;
+            buffer[0] = '\0';
+        } else if (key.type == KEY_CHAR && ((unsigned char)key.ch >= 32 || key.ch == '\t') && len + 1 < buffer_size) {
+            buffer[len++] = key.ch == '\t' ? ' ' : key.ch;
+            buffer[len] = '\0';
+        }
     }
 
-    enable_raw_mode();
-    return ok && buffer[0] != '\0';
+    printf(ANSI_HIDE_CURSOR "\n");
+    fflush(stdout);
+    state->rendered_lines = 2;
+
+    if (!confirmed) {
+        buffer[0] = '\0';
+        return false;
+    }
+    return buffer[0] != '\0';
 }
 
 static bool prompt_confirm(AppState *state, const char *message) {
@@ -1386,7 +1741,7 @@ static bool prompt_confirm(AppState *state, const char *message) {
 
     KeyEvent key = read_key();
     bool confirmed = key.type == KEY_CHAR && (key.ch == 'y' || key.ch == 'Y');
-    printf("\r%s\n", confirmed ? " y" : " N");
+    printf("\r" ANSI_CLEAR_LINE);
     fflush(stdout);
     return confirmed;
 }
@@ -1553,7 +1908,7 @@ static bool open_path_in_editor(AppState *state, const AppConfig *cfg, const cha
         enable_raw_mode();
     }
 
-    state->rendered_lines = 0;
+    state->rendered_lines = ok ? 1 : 0;
     return ok;
 }
 
@@ -1569,13 +1924,9 @@ static void create_note_flow(AppState *state, const AppConfig *cfg) {
         return;
     }
 
-    clear_owned_region(state);
-    disable_raw_mode();
-    printf("Created:\n%s\n\n", path);
-    fflush(stdout);
-    enable_raw_mode();
-
-    open_path_in_editor(state, cfg, path);
+    if (!cfg->open_after_create || open_path_in_editor(state, cfg, path)) {
+        snprintf(state->status, sizeof(state->status), "created \"%s\"", title);
+    }
     load_notes(&state->notes, cfg);
     load_favorites_for_list(&state->notes, cfg);
     normalize_selection(state);
@@ -1590,7 +1941,7 @@ static void delete_note_flow(AppState *state, const AppConfig *cfg) {
     char message[TITLE_MAX + 32];
     snprintf(message, sizeof(message), "Move \"%s\" to trash?", selected.title);
 
-    if (!prompt_confirm(state, message)) {
+    if (cfg->confirm_trash && !prompt_confirm(state, message)) {
         return;
     }
 
@@ -1614,33 +1965,6 @@ static void delete_note_flow(AppState *state, const AppConfig *cfg) {
     push_undo(state, UNDO_TRASH, trash_path, selected.path, selected.title);
 
     snprintf(state->status, sizeof(state->status), "Trashed \"%s\" (press %c to undo)", selected.title, cfg->key_undo);
-
-    load_notes(&state->notes, cfg);
-    load_favorites_for_list(&state->notes, cfg);
-    state->selected = previous;
-    normalize_selection(state);
-}
-
-static void hard_delete_note_flow(AppState *state, const AppConfig *cfg) {
-    (void)cfg;
-
-    if (state->notes.count == 0 || !selected_is_visible(state)) {
-        return;
-    }
-
-    Note selected = state->notes.items[state->selected];
-    char message[TITLE_MAX + 64];
-    snprintf(message, sizeof(message), "Permanently delete \"%s\"?", selected.title);
-
-    if (!prompt_confirm(state, message)) {
-        return;
-    }
-
-    size_t previous = state->selected;
-    if (unlink(selected.path) != 0) {
-        snprintf(state->status, sizeof(state->status), "failed to delete note: %s", strerror(errno));
-        return;
-    }
 
     load_notes(&state->notes, cfg);
     load_favorites_for_list(&state->notes, cfg);
@@ -1858,7 +2182,7 @@ static void trash_viewer_flow(AppState *state, const AppConfig *cfg) {
     }
 
     note_list_free(&trash);
-    state->rendered_lines = 0;
+    clear_owned_region(state);
 }
 #endif
 
@@ -1953,6 +2277,12 @@ static void copy_path_to_clipboard(AppState *state, const AppConfig *cfg) {
 }
 
 static void format_relative_time(time_t mtime, char *buf, size_t buf_size) {
+    if (g_date_absolute) {
+        struct tm *tm = localtime(&mtime);
+        strftime(buf, buf_size, "%b %d %H:%M", tm);
+        return;
+    }
+
     time_t now = time(NULL);
     long diff = (long)(now - mtime);
 
@@ -2195,7 +2525,7 @@ static void set_plugin_disabled_on_disk(const AppConfig *cfg, const char *name, 
 }
 
 static bool key_is_core_reserved(char key) {
-    const char *reserved = "nrdDty*/p:qujkgGv";
+    const char *reserved = "nrdty*/p:qujkgGv?,";
     return key && (strchr(reserved, key) != NULL || key == '\r' || key == '\n');
 }
 
@@ -2283,6 +2613,24 @@ static bool parse_manifest_string(const char *line, const char *key, char *dst, 
     return true;
 }
 
+/* Turns a manifest list like read-note","write-note into read-note, write-note */
+static void tidy_manifest_list(char *s, size_t size) {
+    char out[512];
+    size_t o = 0;
+    for (const char *c = s; *c && o + 3 < sizeof(out); c++) {
+        if (*c == '"' || *c == '\'') continue;
+        if (*c == ',') {
+            out[o++] = ',';
+            out[o++] = ' ';
+            while (c[1] == ' ' || c[1] == '"' || c[1] == '\'') c++;
+            continue;
+        }
+        out[o++] = *c;
+    }
+    out[o] = '\0';
+    snprintf(s, size, "%s", out);
+}
+
 static bool parse_plugin_readme(const char *readme_path, Plugin *plugin) {
     FILE *f = fopen(readme_path, "r");
     if (!f) return false;
@@ -2336,6 +2684,8 @@ static bool parse_plugin_readme(const char *readme_path, Plugin *plugin) {
         }
     }
     fclose(f);
+    tidy_manifest_list(plugin->authors, sizeof(plugin->authors));
+    tidy_manifest_list(plugin->permissions, sizeof(plugin->permissions));
     plugin->has_keybind_conflict = key_is_core_reserved(plugin->keybind);
     return plugin->name[0] != '\0';
 }
@@ -2467,7 +2817,7 @@ static void mark_plugin_keybind_conflicts(PluginList *list, const AppConfig *cfg
 static void render_plugin_keybinds_help(AppState *state, const AppConfig *cfg) {
     PluginList exp_plugins = {NULL, 0, 0};
     scan_addons_dir(&exp_plugins, cfg, cfg->addons_dir);
-    scan_addons_dir(&exp_plugins, cfg, "addons");
+    if (cfg->plugin_scan_cwd) scan_addons_dir(&exp_plugins, cfg, "addons");
     mark_plugin_keybind_conflicts(&exp_plugins, cfg);
 
     bool has_plugins = false;
@@ -2480,32 +2830,22 @@ static void render_plugin_keybinds_help(AppState *state, const AppConfig *cfg) {
     }
 
     if (has_plugins) {
-        char help_line[128];
-        snprintf(help_line, sizeof(help_line), "%s─── %sPlugins%s ───", g_theme.help, g_theme.title, ANSI_RESET);
-        render_line(state, help_line);
-
-        char plugin_line[280];
-        plugin_line[0] = '\0';
-        size_t plen = 0;
+        char plugin_line[1024];
+        size_t width = 7;
+        start_hint_group(plugin_line, sizeof(plugin_line), "plugins");
         for (size_t i = 0; i < exp_plugins.count; i++) {
             Plugin *p = &exp_plugins.items[i];
             if (!p->is_compiled || p->is_disabled || p->has_keybind_conflict || !p->keybind) continue;
-            char entry[64];
-            snprintf(entry, sizeof(entry), "%s[%c] %s%s", g_theme.help, p->keybind, p->name, ANSI_RESET);
-            size_t elen = strlen(entry);
-            if (plen + elen + 3 > sizeof(plugin_line)) {
+            size_t entry_width = 2 + 2 + strlen(p->name);
+            if (width > 7 && width + entry_width > 78) {
                 render_line(state, plugin_line);
-                plugin_line[0] = '\0';
-                plen = 0;
+                start_hint_group(plugin_line, sizeof(plugin_line), "");
+                width = 7;
             }
-            if (plen > 0) {
-                strncat(plugin_line + plen, "  ", sizeof(plugin_line) - plen - 1);
-                plen += 2;
-            }
-            strncat(plugin_line + plen, entry, sizeof(plugin_line) - plen - 1);
-            plen += elen;
+            append_key_hint(plugin_line, sizeof(plugin_line), p->keybind, p->name);
+            width += entry_width;
         }
-        if (plen > 0) {
+        if (width > 7) {
             render_line(state, plugin_line);
         }
     }
@@ -2536,6 +2876,11 @@ static bool files_are_different(const char *path1, const char *path2) {
     return false;
 }
 
+static void plugin_raw_url(const AppConfig *cfg, char *buf, size_t buf_size, const char *path) {
+    snprintf(buf, buf_size, "https://raw.githubusercontent.com/%s/%s/addons/%s",
+             cfg->plugin_repo, cfg->plugin_branch, path);
+}
+
 static void fetch_remote_plugins(AppState *state, const AppConfig *cfg, PluginList *list) {
     clear_owned_region(state);
     disable_raw_mode();
@@ -2546,8 +2891,10 @@ static void fetch_remote_plugins(AppState *state, const AppConfig *cfg, PluginLi
     char temp_index[PATH_MAX];
     snprintf(temp_index, sizeof(temp_index), "%s" PATH_SEP "temp_addons.txt", cfg->data_dir);
 
-    char cmd[PATH_MAX * 2 + 128];
-    snprintf(cmd, sizeof(cmd), "curl -s -f -L \"https://raw.githubusercontent.com/aaravmaloo/blob/master/addons/addons.txt\" -o \"%s\"", temp_index);
+    char cmd[PATH_MAX * 2 + 512];
+    char url[512];
+    plugin_raw_url(cfg, url, sizeof(url), "addons.txt");
+    snprintf(cmd, sizeof(cmd), "curl -s -f -L \"%s\" -o \"%s\"", url, temp_index);
 
     int ret = system(cmd);
     if (ret != 0) {
@@ -2573,7 +2920,7 @@ static void fetch_remote_plugins(AppState *state, const AppConfig *cfg, PluginLi
         while (len > 0 && isspace((unsigned char)line[len - 1])) {
             line[--len] = '\0';
         }
-        if (len == 0) continue;
+        if (len == 0 || !is_safe_url_part(line) || strchr(line, '/')) continue;
 
         Plugin *existing = NULL;
         for (size_t i = 0; i < list->count; i++) {
@@ -2588,7 +2935,10 @@ static void fetch_remote_plugins(AppState *state, const AppConfig *cfg, PluginLi
             if (existing->is_compiled) {
                 char temp_c[PATH_MAX];
                 snprintf(temp_c, sizeof(temp_c), "%s" PATH_SEP "temp_update_%s.c", cfg->data_dir, line);
-                snprintf(cmd, sizeof(cmd), "curl -s -f -L \"https://raw.githubusercontent.com/aaravmaloo/blob/master/addons/%s/%s.c\" -o \"%s\"", line, line, temp_c);
+                char rel[PLUGIN_NAME_MAX * 2 + 8];
+                snprintf(rel, sizeof(rel), "%s/%s.c", line, line);
+                plugin_raw_url(cfg, url, sizeof(url), rel);
+                snprintf(cmd, sizeof(cmd), "curl -s -f -L \"%s\" -o \"%s\"", url, temp_c);
                 if (system(cmd) == 0) {
                     if (files_are_different(temp_c, existing->c_path)) {
                         existing->update_available = true;
@@ -2602,7 +2952,10 @@ static void fetch_remote_plugins(AppState *state, const AppConfig *cfg, PluginLi
         char temp_readme[PATH_MAX];
         snprintf(temp_readme, sizeof(temp_readme), "%s" PATH_SEP "temp_readme_%s.md", cfg->data_dir, line);
 
-        snprintf(cmd, sizeof(cmd), "curl -s -f -L \"https://raw.githubusercontent.com/aaravmaloo/blob/master/addons/%s/README.md\" -o \"%s\"", line, temp_readme);
+        char rel[PLUGIN_NAME_MAX + 16];
+        snprintf(rel, sizeof(rel), "%s/README.md", line);
+        plugin_raw_url(cfg, url, sizeof(url), rel);
+        snprintf(cmd, sizeof(cmd), "curl -s -f -L \"%s\" -o \"%s\"", url, temp_readme);
         if (system(cmd) == 0) {
             Plugin p;
             memset(&p, 0, sizeof(p));
@@ -2672,7 +3025,12 @@ static bool compile_plugin(AppState *state, const AppConfig *cfg, Plugin *plugin
         snprintf(state->status, sizeof(state->status), "Plugin %s keybind conflicts.", plugin->name);
         return false;
     }
-    if (!confirm_plugin_action(state, plugin, plugin->is_compiled ? "Update" : "Install")) {
+    if (plugin->api > 2) {
+        snprintf(state->status, sizeof(state->status), "Plugin %s needs newer blob API.", plugin->name);
+        return false;
+    }
+    if (cfg->plugin_confirm_install &&
+        !confirm_plugin_action(state, plugin, plugin->is_compiled ? "Update" : "Install")) {
         return false;
     }
 
@@ -2719,13 +3077,24 @@ static bool compile_plugin(AppState *state, const AppConfig *cfg, Plugin *plugin
 
     ensure_dir(plugin->dir_path);
 
-    char cmd[PATH_MAX * 2 + 128];
+    char cmd[PATH_MAX * 2 + 512];
+    char url[512];
+    char rel[PLUGIN_NAME_MAX * 2 + 16];
+
+    if ((plugin->is_remote || plugin->update_available) && !is_safe_url_part(plugin->name)) {
+        snprintf(state->status, sizeof(state->status), "Refusing to download plugin with unsafe name.");
+        exit_alt_screen();
+        enable_raw_mode();
+        return false;
+    }
 
     if (plugin->is_remote || plugin->update_available) {
         printf("Downloading plugin source files...\n");
         fflush(stdout);
 
-        snprintf(cmd, sizeof(cmd), "curl -s -f -L \"https://raw.githubusercontent.com/aaravmaloo/blob/master/addons/%s/%s.c\" -o \"%s\"", plugin->name, plugin->name, plugin->c_path);
+        snprintf(rel, sizeof(rel), "%s/%s.c", plugin->name, plugin->name);
+        plugin_raw_url(cfg, url, sizeof(url), rel);
+        snprintf(cmd, sizeof(cmd), "curl -s -f -L \"%s\" -o \"%s\"", url, plugin->c_path);
         if (system(cmd) != 0) {
             printf("Error: failed to download C source file.\nPress any key to continue...");
             fflush(stdout);
@@ -2737,7 +3106,9 @@ static bool compile_plugin(AppState *state, const AppConfig *cfg, Plugin *plugin
 
         char readme_path[PATH_MAX];
         snprintf(readme_path, sizeof(readme_path), "%s" PATH_SEP "README.md", plugin->dir_path);
-        snprintf(cmd, sizeof(cmd), "curl -s -f -L \"https://raw.githubusercontent.com/aaravmaloo/blob/master/addons/%s/README.md\" -o \"%s\"", plugin->name, readme_path);
+        snprintf(rel, sizeof(rel), "%s/README.md", plugin->name);
+        plugin_raw_url(cfg, url, sizeof(url), rel);
+        snprintf(cmd, sizeof(cmd), "curl -s -f -L \"%s\" -o \"%s\"", url, readme_path);
         system(cmd);
     }
 
@@ -2849,7 +3220,11 @@ static void run_plugin_on_target(AppState *state, const Plugin *plugin, const ch
         snprintf(state->status, sizeof(state->status), "Plugin %s keybind conflicts.", plugin->name);
         return;
     }
-    if (ask && !confirm_plugin_action(state, plugin, "Run")) {
+    if (plugin->api > 2) {
+        snprintf(state->status, sizeof(state->status), "Plugin %s needs newer blob API.", plugin->name);
+        return;
+    }
+    if (ask && g_plugin_confirm_run && !confirm_plugin_action(state, plugin, "Run")) {
         return;
     }
 
@@ -2878,19 +3253,56 @@ static void run_plugin_on_note(AppState *state, const Plugin *plugin, const char
 
 static void run_plugin_for_workspace(AppState *state, const Plugin *plugin, const AppConfig *cfg) {
     run_plugin_on_target(state, plugin, cfg->notes_dir, true);
+    load_config((AppConfig *)cfg);
+    load_theme(cfg);
 }
 
-static void render_plugin_ui(AppState *state, PluginList *plugins, size_t selected_plugin) {
+static void describe_plugin_source(const AppConfig *cfg, const Plugin *p, char *buf, size_t buf_size) {
+    if (p->is_remote) {
+        snprintf(buf, buf_size, "github  %s@%s (not downloaded yet)", cfg->plugin_repo, cfg->plugin_branch);
+        return;
+    }
+
+    char resolved[PATH_MAX];
+    const char *shown = p->dir_path;
+#ifndef _WIN32
+    if (realpath(p->dir_path, resolved)) {
+        shown = resolved;
+    }
+#else
+    (void)resolved;
+#endif
+
+    char short_path[PATH_MAX];
+    const char *home = getenv("HOME");
+    size_t home_len = home ? strlen(home) : 0;
+    if (home_len > 1 && strncmp(shown, home, home_len) == 0 && (shown[home_len] == '/' || shown[home_len] == '\0')) {
+        snprintf(short_path, sizeof(short_path), "~%s", shown + home_len);
+        shown = short_path;
+    }
+
+    bool installed = strstr(p->dir_path, cfg->addons_dir) != NULL;
+    snprintf(buf, buf_size, "%s  %s%s",
+             installed ? "installed" : "local",
+             shown,
+             p->exists_on_remote ? "  (also on github)" : "");
+}
+
+static void render_plugin_ui(AppState *state, const AppConfig *cfg, PluginList *plugins, size_t selected_plugin) {
     normalize_selection(state);
     clear_owned_region(state);
 
-    render_line(state, ANSI_BOLD "blob: plugins manager" ANSI_RESET);
+    char header[160];
+    snprintf(header, sizeof(header), ANSI_BOLD "blob" ANSI_RESET "%s  \xc2\xb7  plugins  \xc2\xb7  %zu found" ANSI_RESET,
+             g_theme.help, plugins->count);
+    render_line(state, header);
     render_line(state, "");
 
     if (plugins->count == 0) {
-        render_line(state, ANSI_DIM "no plugins found" ANSI_RESET);
+        char line[64];
+        snprintf(line, sizeof(line), "%s  no plugins found%s", g_theme.help, ANSI_RESET);
+        render_line(state, line);
     } else {
-        /* Compute the widest plugin name for alignment */
         size_t max_name = 15;
         for (size_t i = 0; i < plugins->count; i++) {
             size_t len = strlen(plugins->items[i].name);
@@ -2898,83 +3310,111 @@ static void render_plugin_ui(AppState *state, PluginList *plugins, size_t select
         }
         if (max_name > 25) max_name = 25;
 
-        char fmt[32];
-        snprintf(fmt, sizeof(fmt), "%%s> %%-%zus %%s%%s", max_name);
-
-        char line[280];
         for (size_t i = 0; i < plugins->count; i++) {
             Plugin *p = &plugins->items[i];
-            char status[32] = "";
+            const char *status;
             if (p->is_disabled) {
-                snprintf(status, sizeof(status), "[disabled]");
+                status = "disabled";
             } else if (p->has_keybind_conflict) {
-                snprintf(status, sizeof(status), "[key conflict]");
+                status = "key conflict";
             } else if (p->api > 2) {
-                snprintf(status, sizeof(status), "[newer api]");
+                status = "needs newer blob";
             } else if (p->is_compiled) {
-                if (p->update_available) {
-                    snprintf(status, sizeof(status), "[update available]");
-                } else {
-                    snprintf(status, sizeof(status), "[installed]");
-                }
+                status = p->update_available ? "update available" : "installed";
             } else if (p->is_remote) {
-                snprintf(status, sizeof(status), "[remote]");
+                status = "on github";
             } else {
-                snprintf(status, sizeof(status), "[not compiled]");
+                status = "not compiled";
             }
 
-            /* Truncate name in display only if needed */
-            char display_name[32];
-            size_t nlen = strlen(p->name);
-            if (nlen > max_name) {
-                memcpy(display_name, p->name, max_name);
-                display_name[max_name] = '\0';
-            } else {
-                snprintf(display_name, sizeof(display_name), "%s", p->name);
-            }
+            char name[PLUGIN_NAME_MAX * 4 + 8];
+            fit_column(name, sizeof(name), p->name, max_name);
 
-            const char *prefix = i == selected_plugin ? g_theme.selected : "";
-            snprintf(line, sizeof(line), fmt, prefix, display_name, status, ANSI_RESET);
+            char key[8];
+            snprintf(key, sizeof(key), "%c", p->keybind ? p->keybind : ' ');
+
+            char line[512];
+            if (i == selected_plugin) {
+                snprintf(line, sizeof(line), "%s\xe2\x96\x8c" ANSI_RESET " " ANSI_BOLD "%s%s" ANSI_RESET "  %s%s  %s" ANSI_RESET,
+                         g_theme.selected, g_theme.selected, name, g_theme.help, key, status);
+            } else {
+                snprintf(line, sizeof(line), "  %s%s" ANSI_RESET "  %s%s  %s" ANSI_RESET,
+                         g_theme.title, name, g_theme.help, key, status);
+            }
             render_line(state, line);
         }
     }
 
     render_line(state, "");
-    render_line(state, ANSI_DIM "────────────────────────────────" ANSI_RESET);
-    render_line(state, "");
 
     if (plugins->count > 0 && selected_plugin < plugins->count) {
         Plugin *p = &plugins->items[selected_plugin];
-        char line[512];
-        snprintf(line, sizeof(line), "%sAuthor:%s      %s", g_theme.title, ANSI_RESET, p->authors[0] ? p->authors : "Unknown");
-        render_line(state, line);
-        snprintf(line, sizeof(line), "%sDescription:%s %s", g_theme.title, ANSI_RESET, p->description[0] ? p->description : "None");
-        render_line(state, line);
-        snprintf(line, sizeof(line), "%sKeybind:%s     %c", g_theme.title, ANSI_RESET, p->keybind ? p->keybind : ' ');
-        render_line(state, line);
-        snprintf(line, sizeof(line), "%sAPI/Mode:%s    %d / %s%s", g_theme.title, ANSI_RESET, p->api, p->mode[0] ? p->mode : "note", p->is_legacy ? " (legacy)" : "");
-        render_line(state, line);
-        snprintf(line, sizeof(line), "%sPerms:%s       %s", g_theme.title, ANSI_RESET, p->permissions[0] ? p->permissions : "unknown");
-        render_line(state, line);
+        char source[PATH_MAX + 128];
+        describe_plugin_source(cfg, p, source, sizeof(source));
+
+        char version[64];
+        snprintf(version, sizeof(version), "%s", p->version[0] ? p->version : "unknown");
+        char keybind[8];
+        snprintf(keybind, sizeof(keybind), "%c", p->keybind ? p->keybind : '-');
+        char api_mode[64];
+        snprintf(api_mode, sizeof(api_mode), "%d / %s%s", p->api, p->mode[0] ? p->mode : "note", p->is_legacy ? " (legacy)" : "");
+
+        const char *labels[] = {"description", "author", "version", "keybind", "api / mode", "permissions", "source"};
+        const char *values[] = {
+            p->description[0] ? p->description : "none",
+            p->authors[0] ? p->authors : "unknown",
+            version, keybind, api_mode,
+            p->permissions[0] ? p->permissions : "unknown",
+            source,
+        };
+
+        int cols = terminal_columns();
+        size_t width = cols > 16 ? (size_t)cols - 15 : 1;
+        for (size_t i = 0; i < sizeof(labels) / sizeof(labels[0]); i++) {
+            char value[PATH_MAX + 256];
+            fit_column(value, sizeof(value), values[i], width);
+            size_t end = strlen(value);
+            while (end > 0 && value[end - 1] == ' ') value[--end] = '\0';
+
+            char line[PATH_MAX + 320];
+            snprintf(line, sizeof(line), "%s%-12s" ANSI_RESET " %s", g_theme.help, labels[i], value);
+            render_line(state, line);
+        }
         render_line(state, "");
     }
 
-    char help_line[128];
-    snprintf(help_line, sizeof(help_line), "%s[k] set keybind  [ENTER] compile/run  [u] uninstall%s", g_theme.help, ANSI_RESET);
-    render_line(state, help_line);
-    snprintf(help_line, sizeof(help_line), "%s[u] uninstall (delete binary)%s", g_theme.help, ANSI_RESET);
-    render_line(state, help_line);
-    snprintf(help_line, sizeof(help_line), "%s[t] toggle enable/disable%s", g_theme.help, ANSI_RESET);
-    render_line(state, help_line);
-    snprintf(help_line, sizeof(help_line), "%s[Ctrl+P] disable plugin system%s", g_theme.help, ANSI_RESET);
-    render_line(state, help_line);
-    snprintf(help_line, sizeof(help_line), "%s[ESC/q] back to notes%s", g_theme.help, ANSI_RESET);
-    render_line(state, help_line);
+    char hints[1024];
+    hints[0] = '\0';
+    if (plugins->count > 0 && selected_plugin < plugins->count) {
+        Plugin *p = &plugins->items[selected_plugin];
+        if (p->api > 2) {
+            append_hint(hints, sizeof(hints), "k", "key");
+        } else if (p->has_keybind_conflict) {
+            append_hint(hints, sizeof(hints), "enter", "pick a new key");
+        } else if (!p->is_compiled) {
+            append_hint(hints, sizeof(hints), "enter", p->is_remote ? "download & install" : "install");
+            append_hint(hints, sizeof(hints), "k", "key");
+        } else {
+            if (p->update_available) {
+                append_hint(hints, sizeof(hints), "enter", "update");
+            }
+            append_hint(hints, sizeof(hints), "k", "key");
+            append_hint(hints, sizeof(hints), "u", "uninstall");
+        }
+        append_hint(hints, sizeof(hints), "t", p->is_disabled ? "enable" : "disable");
+        render_line(state, hints);
+    }
+    hints[0] = '\0';
+    append_hint(hints, sizeof(hints), "\xe2\x86\x91\xe2\x86\x93", "move");
+    append_hint(hints, sizeof(hints), ",", "settings");
+    append_hint(hints, sizeof(hints), "^P", "plugins off");
+    append_hint(hints, sizeof(hints), "esc", "back");
+    render_line(state, hints);
 
     if (state->status[0]) {
         render_line(state, "");
         char status_line[INPUT_MAX + 16];
-        snprintf(status_line, sizeof(status_line), ANSI_RED "%s" ANSI_RESET, state->status);
+        snprintf(status_line, sizeof(status_line), "%s%s" ANSI_RESET, g_theme.status, state->status);
         render_line(state, status_line);
         state->status[0] = '\0';
     }
@@ -2982,24 +3422,31 @@ static void render_plugin_ui(AppState *state, PluginList *plugins, size_t select
     fflush(stdout);
 }
 
+static void settings_flow(AppState *state, AppConfig *cfg);
+
 static void plugin_manager_flow(AppState *state, const AppConfig *cfg) {
     PluginList plugins = {NULL, 0, 0};
 
     scan_addons_dir(&plugins, cfg, cfg->addons_dir);
-    scan_addons_dir(&plugins, cfg, "addons");
+    if (cfg->plugin_scan_cwd) scan_addons_dir(&plugins, cfg, "addons");
     mark_plugin_keybind_conflicts(&plugins, cfg);
 
-    bool check_remote = false;
-    if (is_plugin_system_enabled(cfg)) {
-        check_remote = prompt_confirm(state, "Access remote repository?");
-    } else {
+    if (!is_plugin_system_enabled(cfg)) {
         if (prompt_confirm(state, "Plugin system is disabled. Enable it?")) {
             set_plugin_system_enabled(cfg, true);
-            check_remote = prompt_confirm(state, "Access remote repository?");
         } else {
             plugin_list_free(&plugins);
             return;
         }
+    }
+
+    bool check_remote = false;
+    if (cfg->plugin_source == PLUGIN_SOURCE_GITHUB) {
+        check_remote = true;
+    } else if (cfg->plugin_source == PLUGIN_SOURCE_ASK) {
+        char question[256];
+        snprintf(question, sizeof(question), "Check github.com/%s for plugins?", cfg->plugin_repo);
+        check_remote = prompt_confirm(state, question);
     }
 
     if (check_remote) {
@@ -3011,7 +3458,7 @@ static void plugin_manager_flow(AppState *state, const AppConfig *cfg) {
     bool in_menu = true;
 
     while (in_menu) {
-        render_plugin_ui(state, &plugins, selected);
+        render_plugin_ui(state, cfg, &plugins, selected);
         KeyEvent key = read_key();
 
         if (key.type == KEY_UP) {
@@ -3073,10 +3520,14 @@ static void plugin_manager_flow(AppState *state, const AppConfig *cfg) {
         } else if (key.type == KEY_CHAR && key.ch == 'u') {
             if (plugins.count > 0 && selected < plugins.count) {
                 Plugin *p = &plugins.items[selected];
-                if (p->is_compiled || !p->is_remote) {
+                if (p->is_compiled) {
                     delete_plugin(state, cfg, &plugins, &selected, check_remote);
+                } else {
+                    snprintf(state->status, sizeof(state->status), "%s is not installed.", p->name);
                 }
             }
+        } else if (key.type == KEY_CHAR && key.ch == ',') {
+            settings_flow(state, (AppConfig *)cfg);
         } else if (key.type == KEY_CHAR && key.ch == 't') {
             if (plugins.count > 0 && selected < plugins.count) {
                 Plugin *p = &plugins.items[selected];
@@ -3088,7 +3539,7 @@ static void plugin_manager_flow(AppState *state, const AppConfig *cfg) {
     }
 
     plugin_list_free(&plugins);
-    state->rendered_lines = 0;
+    clear_owned_region(state);
 }
 
 static bool is_note_encrypted(const char *path) {
@@ -3117,7 +3568,7 @@ static void open_selected_note(AppState *state, const AppConfig *cfg) {
     if (encrypted) {
         PluginList temp_plugins = {NULL, 0, 0};
         scan_addons_dir(&temp_plugins, cfg, cfg->addons_dir);
-        scan_addons_dir(&temp_plugins, cfg, "addons");
+        if (cfg->plugin_scan_cwd) scan_addons_dir(&temp_plugins, cfg, "addons");
 
         Plugin *lock_plugin = NULL;
         for (size_t i = 0; i < temp_plugins.count; i++) {
@@ -3149,7 +3600,7 @@ static void open_selected_note(AppState *state, const AppConfig *cfg) {
     if (unlocked) {
         PluginList temp_plugins = {NULL, 0, 0};
         scan_addons_dir(&temp_plugins, cfg, cfg->addons_dir);
-        scan_addons_dir(&temp_plugins, cfg, "addons");
+        if (cfg->plugin_scan_cwd) scan_addons_dir(&temp_plugins, cfg, "addons");
 
         Plugin *lock_plugin = NULL;
         for (size_t i = 0; i < temp_plugins.count; i++) {
@@ -3160,15 +3611,13 @@ static void open_selected_note(AppState *state, const AppConfig *cfg) {
         }
 
         if (lock_plugin) {
-            printf("\nRe-encrypting note...\n");
-            fflush(stdout);
+            clear_owned_region(state);
             run_plugin_on_note(state, lock_plugin, path);
         }
         plugin_list_free(&temp_plugins);
     }
 
-    printf("\033[2J\033[H");
-    fflush(stdout);
+    clear_owned_region(state);
 
     load_notes(&state->notes, cfg);
     load_favorites_for_list(&state->notes, cfg);
@@ -3234,10 +3683,29 @@ static void quick_view_flow(AppState *state, const AppConfig *cfg) {
         if (line_count == 0) {
             render_line(state, ANSI_DIM "(empty note)" ANSI_RESET);
         } else {
+            int cols = terminal_columns();
+            size_t width = cols > 1 ? (size_t)cols - 1 : 1;
             size_t shown = 0;
             for (size_t i = scroll; i < line_count && shown < QUICK_VIEW_LINES; i++, shown++) {
-                char line[1100];
-                snprintf(line, sizeof(line), "%s%s", shown == 0 ? g_theme.selected : "", lines[i]);
+                char expanded[4200];
+                size_t e = 0;
+                for (const char *c = lines[i]; *c && e + 5 < sizeof(expanded); c++) {
+                    if (*c == '\t') {
+                        memcpy(expanded + e, "    ", 4);
+                        e += 4;
+                    } else {
+                        expanded[e++] = *c;
+                    }
+                }
+                expanded[e] = '\0';
+
+                char fitted[4300];
+                fit_column(fitted, sizeof(fitted), expanded, width);
+                size_t end = strlen(fitted);
+                while (end > 0 && fitted[end - 1] == ' ') fitted[--end] = '\0';
+
+                char line[4400];
+                snprintf(line, sizeof(line), "%s%s" ANSI_RESET, shown == 0 ? g_theme.selected : "", fitted);
                 render_line(state, line);
             }
             if (line_count > QUICK_VIEW_LINES) {
@@ -3289,7 +3757,7 @@ static void quick_view_flow(AppState *state, const AppConfig *cfg) {
         free(lines[i]);
     }
     free(lines);
-    state->rendered_lines = 0;
+    clear_owned_region(state);
 }
 #endif
 
@@ -3346,7 +3814,7 @@ static int build_doctor_report(const AppConfig *cfg, char *buf, size_t buf_size)
     }
     PluginList exp_plugins = {NULL, 0, 0};
     scan_addons_dir(&exp_plugins, cfg, cfg->addons_dir);
-    scan_addons_dir(&exp_plugins, cfg, "addons");
+    if (cfg->plugin_scan_cwd) scan_addons_dir(&exp_plugins, cfg, "addons");
     mark_plugin_keybind_conflicts(&exp_plugins, cfg);
     for (size_t i = 0; i < exp_plugins.count; i++) {
         Plugin *p = &exp_plugins.items[i];
@@ -3389,20 +3857,39 @@ static void doctor_flow(AppState *state, const AppConfig *cfg) {
     build_doctor_report(cfg, report, sizeof(report));
 
     clear_owned_region(state);
+    disable_raw_mode();
     printf("%s\n", report);
     printf("Press ESC/q to return...");
     fflush(stdout);
+    enable_raw_mode();
 
     KeyEvent k;
     do { k = read_key(); } while (k.type == KEY_NONE);
-    state->rendered_lines = 0;
+    printf("\n");
+
+    int cols = terminal_columns();
+    size_t width = cols > 0 ? (size_t)cols : 80;
+    size_t printed = 2;
+    size_t line_cols = 0;
+    for (const char *c = report; *c; c++) {
+        if (*c == '\n') {
+            printed += line_cols > 0 ? (line_cols - 1) / width : 0;
+            printed++;
+            line_cols = 0;
+        } else if ((((unsigned char)*c) & 0xC0) != 0x80) {
+            line_cols++;
+        }
+    }
+    printed += line_cols > 0 ? (line_cols - 1) / width : 0;
+    state->rendered_lines = printed;
+    clear_owned_region(state);
 }
 #endif
 
 static bool run_named_plugin(AppState *state, const AppConfig *cfg, const char *name) {
     PluginList plugins = {NULL, 0, 0};
     scan_addons_dir(&plugins, cfg, cfg->addons_dir);
-    scan_addons_dir(&plugins, cfg, "addons");
+    if (cfg->plugin_scan_cwd) scan_addons_dir(&plugins, cfg, "addons");
     mark_plugin_keybind_conflicts(&plugins, cfg);
 
     for (size_t i = 0; i < plugins.count; i++) {
@@ -3450,7 +3937,7 @@ static void show_reminders_flow(AppState *state, const AppConfig *cfg) {
         fflush(stdout);
         KeyEvent k = read_key();
         (void)k;
-        state->rendered_lines = 0;
+        clear_owned_region(state);
         return;
     }
 
@@ -3532,7 +4019,7 @@ static void show_reminders_flow(AppState *state, const AppConfig *cfg) {
     /* wait for any keypress to dismiss */
     KeyEvent k;
     do { k = read_key(); } while (k.type == KEY_NONE);
-    state->rendered_lines = 0;
+    clear_owned_region(state);
 }
 
 /* ── keybinding config UI ───────────────────────────────────── */
@@ -3550,7 +4037,6 @@ static void keybindings_config_flow(AppState *state, AppConfig *cfg) {
         {"create",     "New note",     &cfg->key_create},
         {"rename",     "Rename",      &cfg->key_rename},
         {"trash",      "Trash",       &cfg->key_trash},
-        {"delete",     "Delete",      &cfg->key_delete},
         {"trash_bin",  "Trash bin",   &cfg->key_trash_bin},
         {"copy",       "Copy path",   &cfg->key_copy},
         {"star",       "Star",        &cfg->key_star},
@@ -3673,11 +4159,377 @@ static void keybindings_config_flow(AppState *state, AppConfig *cfg) {
         }
     }
 
-    state->rendered_lines = 0;
+    clear_owned_region(state);
 }
 #endif
 
 #ifndef BLOB_TEST
+/* ── settings panel ────────────────────────────────────────────────────── */
+
+typedef enum {
+    SET_EDITOR,
+    SET_THEME,
+    SET_SORT,
+    SET_SORT_REVERSE,
+    SET_RESTORE_SESSION,
+    SET_VISIBLE_NOTES,
+    SET_DATE_STYLE,
+    SET_COLOR_MODE,
+    SET_SHOW_HINTS,
+    SET_CONFIRM_TRASH,
+    SET_OPEN_AFTER_CREATE,
+    SET_PURGE_DAYS,
+    SET_PLUGINS_ENABLED,
+    SET_PLUGIN_SOURCE,
+    SET_PLUGIN_CONFIRM_RUN,
+    SET_PLUGIN_CONFIRM_INSTALL,
+    SET_PLUGIN_SCAN_CWD,
+    SET_PLUGIN_REPO,
+    SET_PLUGIN_BRANCH,
+    SET_EDIT_KEYS,
+    SET_RESET_KEYS
+} SettingId;
+
+typedef struct {
+    SettingId id;
+    int tab;
+    const char *label;
+    const char *help;
+} SettingDef;
+
+static const char *s_setting_tabs[] = {"general", "display", "notes", "plugins", "keys"};
+#define SETTING_TAB_COUNT ((int)(sizeof(s_setting_tabs) / sizeof(s_setting_tabs[0])))
+
+static const SettingDef s_settings[] = {
+    {SET_EDITOR, 0, "editor", "Command used to open notes. Overrides $EDITOR. Arguments are allowed, e.g. \"code -w\"."},
+    {SET_THEME, 0, "theme", NULL},
+    {SET_SORT, 0, "sort by", "Order of the note list. Starred notes always stay on top."},
+    {SET_SORT_REVERSE, 0, "reverse order", "Flip the sort direction."},
+    {SET_RESTORE_SESSION, 0, "reopen last note", "Select the note you had open last time when blob starts."},
+    {SET_VISIBLE_NOTES, 1, "notes per page", "How many notes the list shows before it scrolls."},
+    {SET_DATE_STYLE, 1, "dates", "relative shows \"3h ago\", absolute shows \"Oct 03 14:20\"."},
+    {SET_COLOR_MODE, 1, "colours", "auto picks 24-bit colour when the terminal supports it. Use 256 if themes look wrong."},
+    {SET_SHOW_HINTS, 1, "hint bar", "The shortcut line under the list. ? still shows all keys when it is hidden."},
+    {SET_CONFIRM_TRASH, 2, "ask before trashing", "Ask \"Move to trash?\" when you press d. Trash can always be undone with u."},
+    {SET_OPEN_AFTER_CREATE, 2, "open new notes", "Open the editor straight after creating a note."},
+    {SET_PURGE_DAYS, 2, "empty trash after", "Trashed notes older than this are deleted when blob starts."},
+    {SET_PLUGINS_ENABLED, 3, "plugins", "Turn the whole plugin system on or off."},
+    {SET_PLUGIN_SOURCE, 3, "find plugins on", "local: installed and ./addons only. ask: ask before contacting GitHub. github: always check GitHub."},
+    {SET_PLUGIN_CONFIRM_RUN, 3, "ask before running", "Show a plugin's permissions and ask before it runs. Turning this off runs plugins straight away."},
+    {SET_PLUGIN_CONFIRM_INSTALL, 3, "ask before installing", "Show a plugin's permissions and ask before it is compiled or updated."},
+    {SET_PLUGIN_SCAN_CWD, 3, "include ./addons", "Also list plugins from an addons folder in the directory blob was started in."},
+    {SET_PLUGIN_REPO, 3, "github repo", "owner/name of the repository plugins are downloaded from."},
+    {SET_PLUGIN_BRANCH, 3, "github branch", "Branch plugins are downloaded from."},
+    {SET_EDIT_KEYS, 4, "edit keybindings", "Open the keybinding editor (same as Ctrl+K)."},
+    {SET_RESET_KEYS, 4, "reset keybindings", "Put every core key back to its default."},
+};
+#define SETTING_COUNT (sizeof(s_settings) / sizeof(s_settings[0]))
+
+static const int s_visible_note_steps[] = {5, 8, 10, 12, 15, 20, 25, 30};
+static const int s_purge_day_steps[] = {0, 7, 14, 30, 60, 90, 180};
+
+static int step_cycle(const int *steps, size_t count, int current, int dir) {
+    size_t at = 0;
+    for (size_t i = 0; i < count; i++) {
+        if (steps[i] <= current) at = i;
+    }
+    if (dir > 0) at = at + 1 < count ? at + 1 : 0;
+    else at = at > 0 ? at - 1 : count - 1;
+    return steps[at];
+}
+
+static void setting_value(const AppConfig *cfg, SettingId id, char *buf, size_t buf_size) {
+    switch (id) {
+    case SET_EDITOR: snprintf(buf, buf_size, "%s", cfg->editor); break;
+    case SET_THEME: snprintf(buf, buf_size, "%s", cfg->theme_name); break;
+    case SET_SORT:
+        snprintf(buf, buf_size, "%s", g_sort_mode == SORT_TITLE ? "title" : g_sort_mode == SORT_SIZE ? "size" : "last edited");
+        break;
+    case SET_SORT_REVERSE: snprintf(buf, buf_size, "%s", cfg->sort_reverse ? "on" : "off"); break;
+    case SET_RESTORE_SESSION: snprintf(buf, buf_size, "%s", cfg->restore_session ? "on" : "off"); break;
+    case SET_VISIBLE_NOTES: snprintf(buf, buf_size, "%d", cfg->visible_notes); break;
+    case SET_DATE_STYLE: snprintf(buf, buf_size, "%s", cfg->date_absolute ? "absolute" : "relative"); break;
+    case SET_COLOR_MODE:
+        if (cfg->color_mode == COLOR_MODE_TRUE) snprintf(buf, buf_size, "24-bit");
+        else if (cfg->color_mode == COLOR_MODE_256) snprintf(buf, buf_size, "256");
+        else snprintf(buf, buf_size, "auto (%s)", terminal_supports_true_color() ? "24-bit" : "256");
+        break;
+    case SET_SHOW_HINTS: snprintf(buf, buf_size, "%s", cfg->show_hints ? "shown" : "hidden"); break;
+    case SET_CONFIRM_TRASH: snprintf(buf, buf_size, "%s", cfg->confirm_trash ? "on" : "off"); break;
+    case SET_OPEN_AFTER_CREATE: snprintf(buf, buf_size, "%s", cfg->open_after_create ? "on" : "off"); break;
+    case SET_PURGE_DAYS:
+        if (cfg->purge_days <= 0) snprintf(buf, buf_size, "never");
+        else snprintf(buf, buf_size, "%d days", cfg->purge_days);
+        break;
+    case SET_PLUGINS_ENABLED: snprintf(buf, buf_size, "%s", is_plugin_system_enabled(cfg) ? "on" : "off"); break;
+    case SET_PLUGIN_SOURCE:
+        snprintf(buf, buf_size, "%s", cfg->plugin_source == PLUGIN_SOURCE_LOCAL ? "local only" :
+                                      cfg->plugin_source == PLUGIN_SOURCE_GITHUB ? "github" : "ask before github");
+        break;
+    case SET_PLUGIN_CONFIRM_RUN: snprintf(buf, buf_size, "%s", cfg->plugin_confirm_run ? "on" : "off"); break;
+    case SET_PLUGIN_CONFIRM_INSTALL: snprintf(buf, buf_size, "%s", cfg->plugin_confirm_install ? "on" : "off"); break;
+    case SET_PLUGIN_SCAN_CWD: snprintf(buf, buf_size, "%s", cfg->plugin_scan_cwd ? "on" : "off"); break;
+    case SET_PLUGIN_REPO: snprintf(buf, buf_size, "%s", cfg->plugin_repo); break;
+    case SET_PLUGIN_BRANCH: snprintf(buf, buf_size, "%s", cfg->plugin_branch); break;
+    case SET_EDIT_KEYS:
+    case SET_RESET_KEYS:
+        snprintf(buf, buf_size, "%s", "enter");
+        break;
+    }
+}
+
+/* Applies one change to a setting. dir is +1/-1 for cycling, 0 for enter */
+static void setting_change(AppState *state, AppConfig *cfg, SettingId id, int dir) {
+    int step = dir == 0 ? 1 : dir;
+
+    switch (id) {
+    case SET_EDITOR: {
+        char value[INPUT_MAX];
+        if (prompt_text(state, "Editor command", value, sizeof(value))) {
+            snprintf(cfg->editor, sizeof(cfg->editor), "%s", value);
+        }
+        break;
+    }
+    case SET_THEME: {
+        size_t at = 0;
+        const char *current = resolve_theme_name(cfg->theme_name);
+        for (size_t i = 0; i < s_theme_count; i++) {
+            if (strcmp(s_themes[i].name, current) == 0) at = i;
+        }
+        at = (at + s_theme_count + (size_t)(step > 0 ? 1 : s_theme_count - 1)) % s_theme_count;
+        snprintf(cfg->theme_name, sizeof(cfg->theme_name), "%s", s_themes[at].name);
+        load_theme(cfg);
+        break;
+    }
+    case SET_SORT: {
+        int mode = ((int)g_sort_mode + (step > 0 ? 1 : 2)) % 3;
+        g_sort_mode = (SortMode)mode;
+        snprintf(cfg->sort_order, sizeof(cfg->sort_order), "%s",
+                 g_sort_mode == SORT_TITLE ? "title" : g_sort_mode == SORT_SIZE ? "size" : "mtime");
+        break;
+    }
+    case SET_SORT_REVERSE:
+        cfg->sort_reverse = !cfg->sort_reverse;
+        g_sort_reverse = cfg->sort_reverse;
+        break;
+    case SET_RESTORE_SESSION: cfg->restore_session = !cfg->restore_session; break;
+    case SET_VISIBLE_NOTES:
+        cfg->visible_notes = step_cycle(s_visible_note_steps, sizeof(s_visible_note_steps) / sizeof(int), cfg->visible_notes, step);
+        g_visible_notes = cfg->visible_notes;
+        break;
+    case SET_DATE_STYLE:
+        cfg->date_absolute = !cfg->date_absolute;
+        g_date_absolute = cfg->date_absolute;
+        break;
+    case SET_COLOR_MODE:
+        cfg->color_mode = (ColorMode)(((int)cfg->color_mode + (step > 0 ? 1 : 2)) % 3);
+        load_theme(cfg);
+        break;
+    case SET_SHOW_HINTS: cfg->show_hints = !cfg->show_hints; break;
+    case SET_CONFIRM_TRASH: cfg->confirm_trash = !cfg->confirm_trash; break;
+    case SET_OPEN_AFTER_CREATE: cfg->open_after_create = !cfg->open_after_create; break;
+    case SET_PURGE_DAYS:
+        cfg->purge_days = step_cycle(s_purge_day_steps, sizeof(s_purge_day_steps) / sizeof(int), cfg->purge_days, step);
+        break;
+    case SET_PLUGINS_ENABLED:
+        set_plugin_system_enabled(cfg, !is_plugin_system_enabled(cfg));
+        break;
+    case SET_PLUGIN_SOURCE:
+        cfg->plugin_source = (PluginSource)(((int)cfg->plugin_source + (step > 0 ? 1 : 2)) % 3);
+        break;
+    case SET_PLUGIN_CONFIRM_RUN:
+        cfg->plugin_confirm_run = !cfg->plugin_confirm_run;
+        g_plugin_confirm_run = cfg->plugin_confirm_run;
+        break;
+    case SET_PLUGIN_CONFIRM_INSTALL: cfg->plugin_confirm_install = !cfg->plugin_confirm_install; break;
+    case SET_PLUGIN_SCAN_CWD: cfg->plugin_scan_cwd = !cfg->plugin_scan_cwd; break;
+    case SET_PLUGIN_REPO:
+    case SET_PLUGIN_BRANCH: {
+        bool repo = id == SET_PLUGIN_REPO;
+        char value[INPUT_MAX];
+        if (prompt_text(state, repo ? "GitHub repo (owner/name)" : "GitHub branch", value, sizeof(value))) {
+            if (!is_safe_url_part(value) || (repo && strchr(value, '/') == NULL)) {
+                snprintf(state->status, sizeof(state->status), "\"%s\" is not a valid %s", value, repo ? "owner/name" : "branch name");
+            } else if (repo) {
+                snprintf(cfg->plugin_repo, sizeof(cfg->plugin_repo), "%s", value);
+            } else {
+                snprintf(cfg->plugin_branch, sizeof(cfg->plugin_branch), "%s", value);
+            }
+        }
+        break;
+    }
+    case SET_EDIT_KEYS:
+        if (dir == 0) keybindings_config_flow(state, cfg);
+        return;
+    case SET_RESET_KEYS:
+        if (dir == 0 && prompt_confirm(state, "Reset every core key to its default?")) {
+            set_default_keybindings(cfg);
+            snprintf(state->status, sizeof(state->status), "keybindings reset");
+        } else {
+            return;
+        }
+        break;
+    }
+
+    save_config(cfg);
+}
+
+static void render_settings_ui(AppState *state, const AppConfig *cfg, int tab, size_t selected) {
+    clear_owned_region(state);
+
+    char line[1024];
+    snprintf(line, sizeof(line), ANSI_BOLD "blob" ANSI_RESET "%s  \xc2\xb7  settings" ANSI_RESET, g_theme.help);
+    render_line(state, line);
+    render_line(state, "");
+
+    char tabs[512] = "  ";
+    char underline[512] = "  ";
+    for (int t = 0; t < SETTING_TAB_COUNT; t++) {
+        size_t len = strlen(tabs);
+        size_t name_len = strlen(s_setting_tabs[t]);
+        if (t == tab) {
+            snprintf(tabs + len, sizeof(tabs) - len, ANSI_BOLD "%s%s" ANSI_RESET "   ", g_theme.selected, s_setting_tabs[t]);
+        } else {
+            snprintf(tabs + len, sizeof(tabs) - len, "%s%s" ANSI_RESET "   ", g_theme.help, s_setting_tabs[t]);
+        }
+        size_t ulen = strlen(underline);
+        if (t == tab) {
+            ulen += (size_t)snprintf(underline + ulen, sizeof(underline) - ulen, "%s", g_theme.selected);
+            for (size_t i = 0; i < name_len && ulen + 4 < sizeof(underline); i++) {
+                memcpy(underline + ulen, "\xe2\x94\x80", 3);
+                ulen += 3;
+            }
+            ulen += (size_t)snprintf(underline + ulen, sizeof(underline) - ulen, ANSI_RESET "   ");
+            underline[ulen] = '\0';
+        } else {
+            for (size_t i = 0; i < name_len + 3 && ulen + 2 < sizeof(underline); i++) {
+                underline[ulen++] = ' ';
+            }
+            underline[ulen] = '\0';
+        }
+    }
+    render_line(state, tabs);
+    render_line(state, underline);
+
+    const SettingDef *current = NULL;
+    size_t row = 0;
+    for (size_t i = 0; i < SETTING_COUNT; i++) {
+        if (s_settings[i].tab != tab) continue;
+
+        char value[INPUT_MAX];
+        setting_value(cfg, s_settings[i].id, value, sizeof(value));
+        char label[64];
+        fit_column(label, sizeof(label), s_settings[i].label, 22);
+        char shown[INPUT_MAX + 8];
+        fit_column(shown, sizeof(shown), value, 40);
+
+        if (row == selected) {
+            current = &s_settings[i];
+            snprintf(line, sizeof(line), "%s\xe2\x96\x8c" ANSI_RESET " " ANSI_BOLD "%s%s" ANSI_RESET "  %s%s" ANSI_RESET,
+                     g_theme.selected, g_theme.selected, label, g_theme.title, shown);
+        } else {
+            snprintf(line, sizeof(line), "  %s  %s%s" ANSI_RESET, label, g_theme.title, shown);
+        }
+        render_line(state, line);
+        row++;
+    }
+
+    render_line(state, "");
+    if (current) {
+        const char *text = current->help;
+        char theme_help[160];
+        if (current->id == SET_THEME) {
+            const char *name = resolve_theme_name(cfg->theme_name);
+            snprintf(theme_help, sizeof(theme_help), "Colour preset. Changes apply as you cycle (%zu themes).", s_theme_count);
+            for (size_t i = 0; i < s_theme_count; i++) {
+                if (strcmp(s_themes[i].name, name) == 0) {
+                    snprintf(theme_help, sizeof(theme_help), "%s. Changes apply as you cycle (%zu/%zu).",
+                             s_themes[i].description, i + 1, s_theme_count);
+                }
+            }
+            text = theme_help;
+        }
+        int cols = terminal_columns();
+        size_t width = cols > 4 ? (size_t)cols - 3 : 40;
+        char help[512];
+        fit_column(help, sizeof(help), text, width);
+        size_t end = strlen(help);
+        while (end > 0 && help[end - 1] == ' ') help[--end] = '\0';
+        snprintf(line, sizeof(line), "%s  %s" ANSI_RESET, g_theme.help, help);
+        render_line(state, line);
+        render_line(state, "");
+    }
+
+    char hints[1024];
+    hints[0] = '\0';
+    append_hint(hints, sizeof(hints), "tab", "next section");
+    append_hint(hints, sizeof(hints), "\xe2\x86\x91\xe2\x86\x93", "move");
+    append_hint(hints, sizeof(hints), "\xe2\x86\x90\xe2\x86\x92", "change");
+    append_hint(hints, sizeof(hints), "enter", "edit");
+    append_hint(hints, sizeof(hints), "esc", "done");
+    render_line(state, hints);
+
+    if (state->status[0]) {
+        render_line(state, "");
+        snprintf(line, sizeof(line), "%s%s" ANSI_RESET, g_theme.status, state->status);
+        render_line(state, line);
+        state->status[0] = '\0';
+    }
+    fflush(stdout);
+}
+
+static void settings_flow(AppState *state, AppConfig *cfg) {
+    int tab = 0;
+    size_t selected = 0;
+
+    for (;;) {
+        size_t rows = 0;
+        for (size_t i = 0; i < SETTING_COUNT; i++) {
+            if (s_settings[i].tab == tab) rows++;
+        }
+        if (selected >= rows) selected = rows > 0 ? rows - 1 : 0;
+
+        render_settings_ui(state, cfg, tab, selected);
+        KeyEvent key = read_key();
+
+        const SettingDef *def = NULL;
+        size_t row = 0;
+        for (size_t i = 0; i < SETTING_COUNT; i++) {
+            if (s_settings[i].tab != tab) continue;
+            if (row++ == selected) def = &s_settings[i];
+        }
+
+        if (key.type == KEY_ESCAPE || (key.type == KEY_CHAR && (key.ch == cfg->key_quit || key.ch == ','))) {
+            break;
+        } else if (key.type == KEY_CHAR && key.ch == '\t') {
+            tab = (tab + 1) % SETTING_TAB_COUNT;
+            selected = 0;
+        } else if (key.type == KEY_BACKTAB) {
+            tab = (tab + SETTING_TAB_COUNT - 1) % SETTING_TAB_COUNT;
+            selected = 0;
+        } else if (key.type == KEY_UP || (key.type == KEY_CHAR && key.ch == cfg->key_move_up)) {
+            selected = selected > 0 ? selected - 1 : (rows > 0 ? rows - 1 : 0);
+        } else if (key.type == KEY_DOWN || (key.type == KEY_CHAR && key.ch == cfg->key_move_down)) {
+            selected = selected + 1 < rows ? selected + 1 : 0;
+        } else if (def && (key.type == KEY_RIGHT || (key.type == KEY_CHAR && key.ch == 'l'))) {
+            if (def->id != SET_EDITOR && def->id != SET_PLUGIN_REPO && def->id != SET_PLUGIN_BRANCH) {
+                setting_change(state, cfg, def->id, 1);
+            }
+        } else if (def && (key.type == KEY_LEFT || (key.type == KEY_CHAR && key.ch == 'h'))) {
+            if (def->id != SET_EDITOR && def->id != SET_PLUGIN_REPO && def->id != SET_PLUGIN_BRANCH) {
+                setting_change(state, cfg, def->id, -1);
+            }
+        } else if (def && (key.type == KEY_ENTER || (key.type == KEY_CHAR && key.ch == ' '))) {
+            setting_change(state, cfg, def->id, 0);
+        }
+    }
+
+    clear_owned_region(state);
+    load_notes(&state->notes, cfg);
+    load_favorites_for_list(&state->notes, cfg);
+    normalize_selection(state);
+}
+
 static void command_palette_flow(AppState *state, const AppConfig *cfg) {
     char command[INPUT_MAX];
     command[0] = '\0';
@@ -3695,14 +4547,14 @@ static void command_palette_flow(AppState *state, const AppConfig *cfg) {
         rename_note_flow(state, cfg);
     } else if (strcmp(command, "trash") == 0 || strcmp(command, "delete") == 0 || strcmp(command, "d") == 0) {
         delete_note_flow(state, cfg);
-    } else if (strcmp(command, "hard delete") == 0 || strcmp(command, "purge") == 0) {
-        hard_delete_note_flow(state, cfg);
     } else if (strcmp(command, "restore") == 0 || strcmp(command, "bin") == 0) {
         trash_viewer_flow(state, cfg);
     } else if (strcmp(command, "reminders") == 0 || strcmp(command, "remind") == 0) {
         show_reminders_flow(state, cfg);
     } else if (strcmp(command, "copy path") == 0 || strcmp(command, "copy") == 0) {
         copy_path_to_clipboard(state, cfg);
+    } else if (strcmp(command, "settings") == 0 || strcmp(command, "config") == 0 || strcmp(command, "preferences") == 0) {
+        settings_flow(state, (AppConfig *)cfg);
     } else if (strcmp(command, "plugins") == 0 || strcmp(command, "plugin") == 0) {
         plugin_manager_flow(state, cfg);
     } else if (strcmp(command, "keys") == 0 || strcmp(command, "keybindings") == 0 || strcmp(command, "bindings") == 0) {
@@ -3938,7 +4790,7 @@ static void handle_key(AppState *state, const AppConfig *cfg, KeyEvent key) {
         keybindings_config_flow(state, (AppConfig *)cfg);
         return;
     }
-    if (key.type == KEY_CTRL_O) {
+    if (key.type == KEY_CTRL_O || (key.type == KEY_CHAR && key.ch == '?')) {
         state->show_help_expanded = !state->show_help_expanded;
         return;
     }
@@ -3972,8 +4824,6 @@ static void handle_key(AppState *state, const AppConfig *cfg, KeyEvent key) {
         rename_note_flow(state, cfg);
     } else if (key.ch == cfg->key_trash) {
         delete_note_flow(state, cfg);
-    } else if (key.ch == cfg->key_delete) {
-        hard_delete_note_flow(state, cfg);
     } else if (key.ch == cfg->key_trash_bin) {
         trash_viewer_flow(state, cfg);
     } else if (key.ch == cfg->key_copy) {
@@ -3984,6 +4834,8 @@ static void handle_key(AppState *state, const AppConfig *cfg, KeyEvent key) {
         state->search_mode = true;
         state->search[0] = '\0';
         normalize_selection(state);
+    } else if (key.ch == ',') {
+        settings_flow(state, (AppConfig *)cfg);
     } else if (key.ch == cfg->key_plugins) {
         plugin_manager_flow(state, cfg);
     } else if (key.ch == cfg->key_cmd) {
@@ -4000,7 +4852,7 @@ static void handle_key(AppState *state, const AppConfig *cfg, KeyEvent key) {
         if (is_plugin_system_enabled(cfg) && state->notes.count > 0 && selected_is_visible(state)) {
             PluginList temp_plugins = {NULL, 0, 0};
             scan_addons_dir(&temp_plugins, cfg, cfg->addons_dir);
-            scan_addons_dir(&temp_plugins, cfg, "addons");
+            if (cfg->plugin_scan_cwd) scan_addons_dir(&temp_plugins, cfg, "addons");
             mark_plugin_keybind_conflicts(&temp_plugins, cfg);
 
             for (size_t i = 0; i < temp_plugins.count; i++) {
@@ -4090,7 +4942,7 @@ int main(int argc, char **argv) {
 
     // Session restore: select the last opened note if it still exists
     char session_note[PATH_MAX];
-    if (load_session(&cfg, session_note, sizeof(session_note))) {
+    if (cfg.restore_session && load_session(&cfg, session_note, sizeof(session_note))) {
         for (size_t i = 0; i < state.notes.count; i++) {
             if (strcmp(state.notes.items[i].path, session_note) == 0) {
                 state.selected = i;

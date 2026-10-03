@@ -57,7 +57,7 @@ Fields:
 Reserved core keys:
 
 ```text
-n r d D y / p : q Enter Esc arrows
+n r d t y * / p : q u j k g G v ? , Enter Esc arrows
 ```
 
 Do not use these for plugins. If two plugins use the same key, blob marks both as conflicted.

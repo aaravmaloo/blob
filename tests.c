@@ -95,7 +95,7 @@ static void test_parse_plugin_readme(void) {
     assert(parse_plugin_readme(test_readme, &p));
 
     assert(strcmp(p.name, "My Test Plugin") == 0);
-    assert(strcmp(p.authors, "Alice\", \"Bob") == 0); // Note: current parser logic for authors is basic
+    assert(strcmp(p.authors, "Alice, Bob") == 0);
     assert(strcmp(p.description, "A plugin for testing purposes.") == 0);
     assert(p.keybind == 't');
     assert(p.api == 1);
@@ -129,7 +129,7 @@ static void test_parse_plugin_readme_api2(void) {
     assert(!p.is_legacy);
     assert(strcmp(p.version, "1.2.3") == 0);
     assert(strcmp(p.mode, "workspace") == 0);
-    assert(strcmp(p.permissions, "read-notes\",\"network") == 0);
+    assert(strcmp(p.permissions, "read-notes, network") == 0);
     assert(plugin_uses_workspace(&p));
     assert(!p.has_keybind_conflict);
 
@@ -401,7 +401,6 @@ static void test_keybinding_defaults(void) {
     cfg.key_create = 'n';
     cfg.key_rename = 'r';
     cfg.key_trash = 'd';
-    cfg.key_delete = 'D';
     cfg.key_trash_bin = 't';
     cfg.key_copy = 'y';
     cfg.key_star = '*';
@@ -417,7 +416,6 @@ static void test_keybinding_defaults(void) {
     assert(cfg.key_create == 'n');
     assert(cfg.key_rename == 'r');
     assert(cfg.key_trash == 'd');
-    assert(cfg.key_delete == 'D');
     assert(cfg.key_trash_bin == 't');
     assert(cfg.key_copy == 'y');
     assert(cfg.key_star == '*');
@@ -458,7 +456,6 @@ static void test_keybinding_config_parsing(void) {
     cfg.key_create = 'n';
     cfg.key_rename = 'r';
     cfg.key_trash = 'd';
-    cfg.key_delete = 'D';
     cfg.key_trash_bin = 't';
     cfg.key_copy = 'y';
     cfg.key_star = '*';
@@ -480,7 +477,8 @@ static void test_keybinding_config_parsing(void) {
 
     /* Verify keybindings were loaded */
     assert(cfg.key_create == 'c');
-    assert(cfg.key_delete == 'X');
+    /* Removed key_delete setting is ignored */
+    assert(cfg.key_trash == 'd');
     assert(cfg.key_undo == 'z');
     /* Unchanged defaults */
     assert(cfg.key_rename == 'r');
@@ -519,31 +517,189 @@ static void test_load_theme(void) {
 
     AppConfig cfg;
     memset(&cfg, 0, sizeof(cfg));
+
+    /* Hex colours become exact 24-bit codes when forced */
+    cfg.color_mode = COLOR_MODE_TRUE;
     snprintf(cfg.theme_name, sizeof(cfg.theme_name), "dracula");
-
     load_theme(&cfg);
+    assert(strcmp(g_theme.title, "\x1b[38;2;248;248;242m") == 0);
+    assert(strcmp(g_theme.selected, "\x1b[38;2;189;147;249m") == 0);
+    assert(strcmp(g_theme.star, "\x1b[38;2;241;250;140m") == 0);
+    assert(strcmp(g_theme.pagination, g_theme.timestamp) == 0);
 
-    /* Dracula theme should have specific colors */
-    assert(strcmp(g_theme.title, "\x1b[38;5;141m") == 0);
-    assert(strcmp(g_theme.selected, "\x1b[38;5;84m") == 0);
-    assert(strcmp(g_theme.search, "\x1b[38;5;215m") == 0);
+    /* ...and the nearest xterm colour in 256 mode */
+    cfg.color_mode = COLOR_MODE_256;
+    load_theme(&cfg);
+    assert(strcmp(g_theme.status, "\x1b[38;5;203m") == 0);
 
-    /* Test default theme */
+    assert(rgb_to_xterm256(0, 0, 0) == 16);
+    assert(rgb_to_xterm256(255, 0, 0) == 196);
+    assert(rgb_to_xterm256(255, 255, 255) == 231);
+    assert(rgb_to_xterm256(128, 128, 128) == 244);
+
+    /* Old theme names still work */
+    assert(strcmp(resolve_theme_name("dark"), "tokyo-night") == 0);
+    assert(strcmp(resolve_theme_name("light"), "catppuccin-latte") == 0);
+    assert(strcmp(resolve_theme_name("solarized"), "solarized-dark") == 0);
+    assert(strcmp(resolve_theme_name("nord"), "nord") == 0);
+
+    /* The default theme follows the terminal's own palette */
     snprintf(cfg.theme_name, sizeof(cfg.theme_name), "default");
     load_theme(&cfg);
-    assert(strcmp(g_theme.title, "\x1b[36m") == 0);
-    assert(strcmp(g_theme.selected, "\x1b[32m") == 0);
+    assert(strcmp(g_theme.title, "\x1b[39m") == 0);
+    assert(strcmp(g_theme.selected, "\x1b[36m") == 0);
 
-    /* Test unknown theme falls back gracefully */
+    /* Unknown names keep the last loaded colours */
     snprintf(cfg.theme_name, sizeof(cfg.theme_name), "nonexistent");
     load_theme(&cfg);
-    /* Should keep the last loaded values (default) */
-    assert(strcmp(g_theme.title, "\x1b[36m") == 0);
+    assert(strcmp(g_theme.title, "\x1b[39m") == 0);
 
-    /* Restore */
+    /* Every preset has a unique name and only valid colour values */
+    for (size_t i = 0; i < s_theme_count; i++) {
+        const char *colors[] = {s_themes[i].title, s_themes[i].selected, s_themes[i].search, s_themes[i].help,
+                                s_themes[i].status, s_themes[i].timestamp, s_themes[i].star};
+        for (size_t c = 0; c < sizeof(colors) / sizeof(colors[0]); c++) {
+            assert(colors[c][0] == '\x1b' || (colors[c][0] == '#' && strlen(colors[c]) == 7));
+        }
+        for (size_t j = i + 1; j < s_theme_count; j++) {
+            assert(strcmp(s_themes[i].name, s_themes[j].name) != 0);
+        }
+    }
+
     g_theme = saved;
-
     printf("test_load_theme passed\n");
+}
+
+static void test_fit_column(void) {
+    char buf[64];
+
+    fit_column(buf, sizeof(buf), "grocery list", 16);
+    assert(strcmp(buf, "grocery list    ") == 0);
+
+    fit_column(buf, sizeof(buf), "ideas for daily notes", 10);
+    assert(strcmp(buf, "ideas for\xe2\x80\xa6") == 0);
+
+    fit_column(buf, sizeof(buf), "exactly10!", 10);
+    assert(strcmp(buf, "exactly10!") == 0);
+
+    /* Multi-byte characters count as one column and are never split */
+    fit_column(buf, sizeof(buf), "caf\xc3\xa9 notes", 5);
+    assert(strcmp(buf, "caf\xc3\xa9\xe2\x80\xa6") == 0);
+
+    fit_column(buf, sizeof(buf), "", 3);
+    assert(strcmp(buf, "   ") == 0);
+
+    printf("test_fit_column passed\n");
+}
+
+static void test_sort_label(void) {
+    SortMode saved_mode = g_sort_mode;
+    bool saved_reverse = g_sort_reverse;
+
+    g_sort_mode = SORT_MTIME;
+    g_sort_reverse = false;
+    assert(strcmp(sort_label(), "newest first") == 0);
+    g_sort_reverse = true;
+    assert(strcmp(sort_label(), "oldest first") == 0);
+    g_sort_mode = SORT_TITLE;
+    assert(strcmp(sort_label(), "z-a") == 0);
+    g_sort_mode = SORT_SIZE;
+    g_sort_reverse = false;
+    assert(strcmp(sort_label(), "smallest first") == 0);
+
+    g_sort_mode = saved_mode;
+    g_sort_reverse = saved_reverse;
+    printf("test_sort_label passed\n");
+}
+
+static void test_is_safe_url_part(void) {
+    assert(is_safe_url_part("aaravmaloo/blob"));
+    assert(is_safe_url_part("master"));
+    assert(is_safe_url_part("release-1.5_x"));
+    assert(!is_safe_url_part(""));
+    assert(!is_safe_url_part("evil\";rm -rf ~;\""));
+    assert(!is_safe_url_part("a b"));
+    assert(!is_safe_url_part("$(whoami)"));
+    assert(!is_safe_url_part("../etc"));
+    assert(!is_safe_url_part("/abs"));
+    assert(!is_safe_url_part("-o"));
+    printf("test_is_safe_url_part passed\n");
+}
+
+static void test_settings_config_roundtrip(void) {
+    const char *test_config = "test_settings.conf";
+    FILE *f = fopen(test_config, "w");
+    assert(f != NULL);
+    fprintf(f, "restore_session = false\n");
+    fprintf(f, "visible_notes = 20\n");
+    fprintf(f, "date_style = absolute\n");
+    fprintf(f, "show_hints = off\n");
+    fprintf(f, "confirm_trash = no\n");
+    fprintf(f, "open_after_create = false\n");
+    fprintf(f, "plugin_source = local\n");
+    fprintf(f, "plugin_confirm_run = false\n");
+    fprintf(f, "plugin_confirm_install = false\n");
+    fprintf(f, "plugin_scan_cwd = false\n");
+    fprintf(f, "plugin_repo = someone/blob-plugins\n");
+    fprintf(f, "plugin_branch = main\n");
+    fclose(f);
+
+    AppConfig cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    set_config_defaults(&cfg);
+    assert(cfg.restore_session && cfg.show_hints && cfg.confirm_trash);
+    assert(cfg.plugin_source == PLUGIN_SOURCE_ASK);
+    assert(strcmp(cfg.plugin_repo, "aaravmaloo/blob") == 0);
+
+    snprintf(cfg.config_path, sizeof(cfg.config_path), "%s", test_config);
+    load_config(&cfg);
+
+    assert(!cfg.restore_session);
+    assert(cfg.visible_notes == 20 && g_visible_notes == 20);
+    assert(cfg.date_absolute && g_date_absolute);
+    assert(!cfg.show_hints);
+    assert(!cfg.confirm_trash);
+    assert(!cfg.open_after_create);
+    assert(cfg.plugin_source == PLUGIN_SOURCE_LOCAL);
+    assert(!cfg.plugin_confirm_run && !g_plugin_confirm_run);
+    assert(!cfg.plugin_confirm_install);
+    assert(!cfg.plugin_scan_cwd);
+    assert(strcmp(cfg.plugin_repo, "someone/blob-plugins") == 0);
+    assert(strcmp(cfg.plugin_branch, "main") == 0);
+
+    /* Saving and loading again gives the same values */
+    snprintf(cfg.editor, sizeof(cfg.editor), "nvim");
+    snprintf(cfg.theme_name, sizeof(cfg.theme_name), "dark");
+    snprintf(cfg.sort_order, sizeof(cfg.sort_order), "mtime");
+    save_config(&cfg);
+    AppConfig again;
+    memset(&again, 0, sizeof(again));
+    set_config_defaults(&again);
+    snprintf(again.config_path, sizeof(again.config_path), "%s", test_config);
+    load_config(&again);
+    assert(again.visible_notes == 20 && again.date_absolute && !again.show_hints);
+    assert(again.plugin_source == PLUGIN_SOURCE_LOCAL);
+    assert(strcmp(again.plugin_repo, "someone/blob-plugins") == 0);
+
+    /* Unsafe repo names and out-of-range values are ignored */
+    f = fopen(test_config, "w");
+    assert(f != NULL);
+    fprintf(f, "plugin_repo = x\";touch /tmp/pwned;\"\n");
+    fprintf(f, "plugin_branch = $(id)\n");
+    fprintf(f, "visible_notes = 9999\n");
+    fclose(f);
+    AppConfig unsafe;
+    memset(&unsafe, 0, sizeof(unsafe));
+    set_config_defaults(&unsafe);
+    snprintf(unsafe.config_path, sizeof(unsafe.config_path), "%s", test_config);
+    load_config(&unsafe);
+    assert(strcmp(unsafe.plugin_repo, "aaravmaloo/blob") == 0);
+    assert(strcmp(unsafe.plugin_branch, "master") == 0);
+    assert(unsafe.visible_notes == DEFAULT_VISIBLE_NOTES);
+
+    set_config_defaults(&unsafe);
+    remove(test_config);
+    printf("test_settings_config_roundtrip passed\n");
 }
 
 int main(void) {
@@ -563,6 +719,10 @@ int main(void) {
     test_keybinding_defaults();
     test_keybinding_config_parsing();
     test_load_theme();
+    test_fit_column();
+    test_sort_label();
+    test_is_safe_url_part();
+    test_settings_config_roundtrip();
 
     printf("\nAll tests passed!\n");
     return 0;

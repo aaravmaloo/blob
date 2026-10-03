@@ -18,12 +18,12 @@
 - inline interactive note selector
 - markdown note creation
 - live note search
-- rename, trash, restore, and hard delete flows
+- rename, trash, and restore flows (permanent deletion only happens from the trash bin)
 - interactive trash bin viewer (`t`) — browse, restore, or purge trashed notes
 - command palette for core actions and installed plugins
 - favorites / starred notes (`*`) — float favourite notes to the top
 - config file (`~/.local/share/blob/config`) — persistent editor, theme, and sort settings
-- built-in themes — dark, light, dracula, solarized presets with a plugin switcher
+- 21 built-in themes — dark and light versions of Catppuccin, Tokyo Night, Gruvbox, Rosé Pine, Dracula, Solarized, Everforest, Kanagawa and One, plus Nord, `default` and `mono`, with 24-bit colour and a live preview
 - relative timestamps and pagination
 - safer plugin installs with API, mode, and permission metadata
 - multi-level undo (`u`) and redo (`Ctrl+Z`) — undo up to 10 previous trash/rename actions
@@ -37,6 +37,8 @@
 
 ## Customizing blob
 
+Press `,` (or run `:settings`) to open the settings panel. `Tab` / `Shift+Tab` switch between the **general**, **display**, **notes**, **plugins** and **keys** sections, `↑/↓` move, `←/→` change a value and `Enter` edits text values. Every change is saved to the config file immediately.
+
 blob reads `~/.local/share/blob/config` on startup. The config file uses a simple `key = value` format:
 
 ```
@@ -48,13 +50,45 @@ sort = mtime
 | Setting  | Description |
 |----------|-------------|
 | `editor` | Overrides `$EDITOR` (default: `vim` on macOS/Linux, `notepad` on Windows) |
-| `theme`  | Color preset: `default`, `dark`, `light`, `dracula`, `solarized` |
+| `theme`  | Color preset, see [Themes](#themes). `dark`, `light` and `solarized` still work as aliases |
+| `colors` | `auto` (24-bit when the terminal supports it), `truecolor`, or `256` |
 | `sort`   | Sort order: `mtime` (newest first), `title` (alphabetical), `size` |
 | `sort_reverse` | `true`/`false` — reverse the sort direction (favorites still float to top) |
 | `purge_days` | Auto-delete trashed notes older than this many days (`0` disables) |
 | `key_view` | Keybind for quick view mode (default: `v`) |
+| `restore_session` | `true`/`false` — reselect the last opened note on startup (default `true`) |
+| `visible_notes` | Notes shown before the list scrolls, `3`–`50` (default `12`) |
+| `date_style` | `relative` (`3h ago`) or `absolute` (`Oct 03 14:20`) |
+| `show_hints` | `true`/`false` — show the shortcut line under the list |
+| `confirm_trash` | `true`/`false` — ask before moving a note to the trash (default `true`) |
+| `open_after_create` | `true`/`false` — open the editor right after creating a note (default `true`) |
+| `plugin_source` | `local` (installed and `./addons` only), `ask` (ask before contacting GitHub, default) or `github` (always check GitHub) |
+| `plugin_confirm_run` | `true`/`false` — show permissions and ask before running a plugin (default `true`) |
+| `plugin_confirm_install` | `true`/`false` — show permissions and ask before installing or updating a plugin (default `true`) |
+| `plugin_scan_cwd` | `true`/`false` — also list plugins from `./addons` in the current folder (default `true`) |
+| `plugin_repo` | GitHub `owner/name` plugins are downloaded from (default `aaravmaloo/blob`) |
+| `plugin_branch` | Branch plugins are downloaded from (default `master`) |
 
 You can also set the editor via the `EDITOR` environment variable — the config file takes precedence.
+
+## Themes
+
+Change the theme from settings (`,` → general → theme, colours change as you press `←/→`) or with the `themes` plugin (`c`), which shows a live preview.
+
+| Dark | Light |
+|------|-------|
+| `catppuccin-mocha` | `catppuccin-latte` |
+| `tokyo-night` | `tokyo-night-day` |
+| `gruvbox-dark` | `gruvbox-light` |
+| `rose-pine` | `rose-pine-dawn` |
+| `dracula` | `alucard` |
+| `solarized-dark` | `solarized-light` |
+| `everforest` | `everforest-light` |
+| `kanagawa` | `kanagawa-lotus` |
+| `one-dark` | `one-light` |
+| `nord` | |
+
+`default` uses your terminal's own colour palette and `mono` uses no colour at all. Named themes use exact 24-bit colours on terminals that support them (kitty, iTerm2, WezTerm, Ghostty, Alacritty, Windows Terminal, VS Code) and the nearest 256-colour match elsewhere, such as Apple Terminal. Set `colors = 256` if a theme looks wrong. Pick a dark theme for a dark terminal background and a light theme for a light one.
 
 ## Installation
 blob can be installed via yay, brew, winget, [github releases](https://github.com/aaravmaloo/blob/releases), or can be compiled from scratch.
@@ -106,13 +140,13 @@ make release
 | `n` | Create note |
 | `r` | Rename note |
 | `d` | Move note to trash |
-| `D` | Permanently delete note |
 | `t` | Open trash bin (restore or permanently delete trashed notes) |
 | `y` | Copy note path |
 | `*` | Star / unstar note (floats to top) |
 | `/` | Search notes |
 | `:` | Open command palette |
 | `p` | Open plugins manager |
+| `,` | Open settings |
 | `v` | Quick view note (read inline, `e` to edit) |
 | `g` / `G` | Jump to first / last note |
 | `PgUp` / `PgDn` | Scroll a full page |
@@ -120,6 +154,7 @@ make release
 | `Ctrl+T` | Cycle sort order (mtime → title → size) |
 | `Ctrl+Z` | Redo |
 | `Ctrl+R` | Show reminders |
+| `?` / `Ctrl+O` | Show all keybindings |
 | `Esc` | Clear search |
 | `q` | Quit |
 
@@ -144,7 +179,7 @@ Plugins declare an API version, run mode, and permissions in their README manife
 | `open-dir` | `o` | Open the note's folder in your file explorer |
 | `export` | `e` | Export to HTML, PDF, or DOCX via pandoc |
 | `remind` | `m` | Set a timed system notification for a note |
-| `themes` | `c` | Select and apply a built-in color theme |
+| `themes` | `c` | Pick one of the 21 built-in themes with a live preview |
 
 If you are a developer and want to create your own plugin, see [PLUGIN_DEVELOPMENT.md](PLUGIN_DEVELOPMENT.md).
 
