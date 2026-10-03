@@ -2,7 +2,7 @@
 
 #define _DEFAULT_SOURCE
 
-#define BLOB_VERSION "1.4.0"
+#define BLOB_VERSION "1.5.0"
 
 #include <ctype.h>
 #include <errno.h>
@@ -1484,10 +1484,14 @@ static bool open_path_in_editor(AppState *state, const AppConfig *cfg, const cha
     ZeroMemory(&si, sizeof(si));
     ZeroMemory(&pi, sizeof(pi));
     si.cb = sizeof(si);
-bool ok = CreateProcessA(NULL, command, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi) != 0;
-if (ok) {
-
+    bool launched = CreateProcessA(NULL, command, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi) != 0;
+    int exit_code = -1;
+    if (launched) {
         WaitForSingleObject(pi.hProcess, INFINITE);
+        DWORD code = 0;
+        if (GetExitCodeProcess(pi.hProcess, &code)) {
+            exit_code = (int)code;
+        }
         CloseHandle(pi.hProcess);
         CloseHandle(pi.hThread);
     }
@@ -1505,7 +1509,8 @@ if (ok) {
     argv[argc + 1] = NULL;
 
     pid_t pid = fork();
-    bool ok = pid >= 0;
+    bool launched = pid >= 0;
+    int exit_code = -1;
 
     if (pid == 0) {
         execvp(argv[0], argv);
@@ -1514,10 +1519,40 @@ if (ok) {
         int status = 0;
         while (waitpid(pid, &status, 0) == -1 && errno == EINTR) {
         }
+        if (WIFEXITED(status)) {
+            exit_code = WEXITSTATUS(status);
+        } else if (WIFSIGNALED(status)) {
+            exit_code = 128 + WTERMSIG(status);
+        }
+        // execvp failing in the child is reported as 127
+        if (exit_code == 127) {
+            launched = false;
+        }
     }
 #endif
 
-    enable_raw_mode();
+    bool ok = launched && exit_code == 0;
+
+    // Keep the editor's error output on screen instead of redrawing over it
+    if (!ok) {
+        if (!launched) {
+            printf("\nblob: could not launch editor '%s'. Check the 'editor' setting or $EDITOR.\n",
+                   cfg->editor);
+            snprintf(state->status, sizeof(state->status), "failed to launch editor: %s", cfg->editor);
+        } else {
+            printf("\nblob: editor '%s' exited with code %d (see the error above).\n",
+                   cfg->editor, exit_code);
+            snprintf(state->status, sizeof(state->status), "editor exited with code %d", exit_code);
+        }
+        printf("Press any key to continue...");
+        fflush(stdout);
+        enable_raw_mode();
+        read_key();
+        printf("\n");
+    } else {
+        enable_raw_mode();
+    }
+
     state->rendered_lines = 0;
     return ok;
 }
@@ -3109,9 +3144,7 @@ static void open_selected_note(AppState *state, const AppConfig *cfg) {
         plugin_list_free(&temp_plugins);
     }
 
-    if (!open_path_in_editor(state, cfg, path)) {
-        snprintf(state->status, sizeof(state->status), "failed to launch editor");
-    }
+    open_path_in_editor(state, cfg, path);
 
     if (unlocked) {
         PluginList temp_plugins = {NULL, 0, 0};
