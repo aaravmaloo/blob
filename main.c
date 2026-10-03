@@ -3422,6 +3422,7 @@ static void render_plugin_ui(AppState *state, const AppConfig *cfg, PluginList *
     fflush(stdout);
 }
 
+#ifndef BLOB_TEST
 static void settings_flow(AppState *state, AppConfig *cfg);
 
 static void plugin_manager_flow(AppState *state, const AppConfig *cfg) {
@@ -3541,6 +3542,7 @@ static void plugin_manager_flow(AppState *state, const AppConfig *cfg) {
     plugin_list_free(&plugins);
     clear_owned_region(state);
 }
+#endif
 
 static bool is_note_encrypted(const char *path) {
     FILE *f = fopen(path, "rb");
